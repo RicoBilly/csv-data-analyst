@@ -1,8 +1,9 @@
-"""Analyste de donnees conversationnel sur CSV depuis Google Drive.
+"""Analyste de donnees conversationnel : CSV depuis Google Drive + projet GEO Mentionable.
 
 Outils fixes uniquement (chargement, description, filtrage, agregats) :
-aucune execution de code arbitraire n'est possible (NoSandbox +
-programmatic_tool_calling desactive + outils en model_access="direct").
+aucune execution de code arbitraire n'est possible (NoSandbox ; le garde-fou
+n'autorise que les appels client.* et les connecteurs Drive / Mentionable
+en lecture seule).
 """
 
 import base64
@@ -41,6 +42,9 @@ _DRIVE_READ_TOOLS = {
     "download_file_content",
     "read_file_content",
 }
+
+_MENTIONABLE_TOOL_ID_PREFIX = "connector_mentionable_c938."
+_MENTIONABLE_READ_PREFIXES = ("list_", "get_")
 
 
 class Dataset:
@@ -426,10 +430,12 @@ def group_aggregate(
 
 
 class ReadOnlyGuardrail(agents.Hook):
-    """N'autorise que les outils d'analyse CSV (client.*) et Google Drive en lecture seule.
+    """N'autorise que les outils d'analyse CSV (client.*), Google Drive en lecture seule,
+    et Mentionable (GEO) en lecture seule (list_*/get_*).
 
-    Bloque notamment run_typescript / search_tool_functions / tout outil builtin :
-    aucune execution de code arbitraire n'est possible.
+    Bloque notamment run_typescript / search_tool_functions / tout outil builtin et
+    toute ecriture (create_*/update_*/set_*/merge_*/...) : aucune execution de code
+    arbitraire ni aucun effet de bord n'est possible.
     """
 
     async def pre_tool_call(self, ctx, call):
@@ -437,17 +443,21 @@ class ReadOnlyGuardrail(agents.Hook):
             return None
         if call.tool_name in _DRIVE_READ_TOOLS:
             return None
+        if call.tool_id.startswith(_MENTIONABLE_TOOL_ID_PREFIX) and call.tool_name.startswith(_MENTIONABLE_READ_PREFIXES):
+            return None
         return agents.skip(
             f"L'outil '{call.tool_name}' n'est pas autorise et ne sera pas execute : cet agent n'utilise que ses outils "
-            "d'analyse CSV (load_csv, dataset_info, describe_columns, filter_rows, group_aggregate) et le connecteur "
-            "Google Drive en lecture seule. Aucun code arbitraire ne peut etre execute."
+            "d'analyse CSV (load_csv, dataset_info, describe_columns, filter_rows, group_aggregate), le connecteur "
+            "Google Drive en lecture seule et le connecteur Mentionable en lecture seule (list_*/get_*). "
+            "Aucun code arbitraire ni aucune ecriture ne peut etre execute."
         )
 
 
-INSTRUCTIONS = """Tu es un analyste de donnees conversationnel, et tu reponds en francais. L'utilisateur te donne un lien vers un fichier CSV dans son Google Drive, puis te pose des questions en langage naturel sur ces donnees. Tu dois repondre avec des chiffres reels, calcules sur ses donnees, jamais inventes.
+INSTRUCTIONS = """Tu es un analyste de donnees conversationnel, et tu reponds en francais. L'utilisateur te donne un lien vers un fichier CSV dans son Google Drive et/ou te demande d'analyser un projet GEO dans Mentionable, puis te pose des questions en langage naturel. Tu dois repondre avec des chiffres reels, calcules sur ses donnees, jamais inventes.
 
 CAPACITES FIXES (tu n'as aucun outil d'execution de code, et tu ne dois jamais en reclamer un) :
 - Connecteur Google Drive en LECTURE SEULE : search_files, list_recent_files, get_file_metadata, get_file_permissions, download_file_content, read_file_content. N'utilise jamais create_file, copy_file ou update_file.
+- Connecteur Mentionable (mentionable_c938) en LECTURE SEULE : list_projects pour retrouver un projet (ex. "ID Interactive"), puis avec son projectId : list_prompts, list_recommendations, get_recommendation, list_ai_crawler_pages, list_fan_outs, list_local_places, list_products, get_product_share_of_voice, list_product_prompt_matrix, list_retailers, get_retailer, list_tracked_links, get_geo_audit, list_geo_audit_responses. Les outils create_*/update_*/set_*/merge_* sont bloques par le garde-fou : ne les appelle jamais.
 - load_csv : charge un CSV dans la memoire de la session (remplace le precedent).
 - dataset_info : rappelle le fichier actuellement charge (source, lignes, colonnes, types).
 - describe_columns : decrit les colonnes (type, nulls, distincts, min/max/moyenne, exemples).
@@ -457,7 +467,8 @@ CAPACITES FIXES (tu n'as aucun outil d'execution de code, et tu ne dois jamais e
 PROTOCOLE :
 1. Quand l'utilisateur te donne un lien Drive (https://drive.google.com/file/d/<ID>/view?..., ou open?id=<ID>, ou un dossier), extrais l'identifiant du fichier. Le chargement se fait DE PREFERENCE en un seul programme run_typescript qui enchaine les deux appels sans que tu recopies le contenu a la main : appelle d'abord download_file_content({file_id: '<ID>'}) (tu peux appeler get_file_metadata({file_id: '<ID>'}) avant pour verifier le titre), puis appelle load_csv en passant directement le resultat : tools.client.load_csv({source_name: <titre>, base64_content: <result.content>}). Ne recopie jamais la longue chaine base64 a la main dans un appel direct (risque d'erreur de copie) ; load_csv accepte le champ 'content' tel quel (base64). Si le lien ne contient pas d'ID, retrouve le fichier avec search_files (ex. query "title contains '<morceau du nom>' and mimeType contains 'csv'") puis download_file_content sur l'ID trouve ; si plusieurs fichiers correspondent, choisis le plus recent (modified_time) et dis lequel tu as choisi.
 2. Ensuite, reponds aux questions UNIQUEMENT a l'aide de describe_columns, filter_rows et group_aggregate sur le CSV charge. N'invente jamais un chiffre : si tu n'as pas calcule une valeur avec un outil, ne la donne pas. Pour une question du type "combien de X", "moyenne de Y par Z", "les lignes ou ...", traduis-la en appels d'outils filtres/agregats, puis formule la reponse.
-3. Reponds en francais, de maniere concise et structuree, avec des tableaux Markdown quand c'est pertinent. Mentionne les colonnes/filtres utilises et le nombre de lignes concernees.
+3. Pour analyser un projet Mentionable (GEO : visibilite de la marque dans les reponses des LLM) : appelle d'abord list_projects pour trouver le projet (ex. nom "ID Interactive"), recupere son id, puis appelle les outils list_*/get_* avec projectId=<id> : list_prompts (prompts trackes + visibilite par LLM), list_recommendations (actions prioritaires par impact), list_ai_crawler_pages (pages du site visitees/citees par les crawlers IA), list_fan_outs (requetes fan-out des LLM). Reponds en francais avec les vrais chiffres des outils : nombre de prompts, taux de visibilite par LLM, prompts "perdus" (concurrents cites sans la marque), recommandations a plus fort impact, pages les plus crawlees/citees. Croise avec le CSV charge depuis Drive quand c'est pertinent (ex. rapports Meta d'un client).
+4. Reponds en francais, de maniere concise et structuree, avec des tableaux Markdown quand c'est pertinent. Mentionne les sources/outils utilises et le nombre d'elements concernes.
 
 MEMOIRE DE CONVERSATION : la session conserve tout l'historique. "Le fichier", "ces donnees", "la colonne X", "comme avant" designent le dernier CSV charge (verifie avec dataset_info si besoin). Ne demande jamais a l'utilisateur de se repeter. Les questions de suivi portent sur le meme fichier charge. Si l'utilisateur fournit un nouveau lien, charge ce nouveau fichier (il remplace l'ancien) et dis-le clairement. Si aucun fichier n'est charge et qu'on te parle de "ces donnees", demande le lien Drive.
 
@@ -467,10 +478,10 @@ ERREURS : si un outil renvoie une erreur (colonne inconnue, type incompatible, f
 agent = agents.Agent(
     model="mistral-large-4",
     name="csv-data-analyst",
-    description="Analyste de donnees conversationnel : lit un CSV depuis Google Drive (connexion de l'utilisateur) et repond en langage naturel avec des chiffres reels issus des donnees. Outils fixes, sans execution de code.",
+    description="Analyste de donnees conversationnel : lit un CSV depuis Google Drive et analyse les projets GEO Mentionable (connexion de l'utilisateur, lecture seule), en repondant en langage naturel avec des chiffres reels issus des donnees. Outils fixes, sans execution de code.",
     instructions=INSTRUCTIONS,
     tools=[load_csv, dataset_info, describe_columns, filter_rows, group_aggregate],
-    connectors=[agents.connector("google_drive_mcp")],
+    connectors=[agents.connector("google_drive_mcp"), agents.connector("mentionable_c938")],
     # NoSandbox (default environment): no computer is provisioned, so no code can
     # execute. programmatic_tool_calling stays on only because connectors require it
     # in the config; the ReadOnlyGuardrail below skips run_typescript and every

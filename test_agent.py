@@ -91,6 +91,17 @@ async def test_guardrail() -> None:
     denied = agents.hook.PreToolCall(turn_id="t", tool_name="create_file", tool_id="connector_google_drive_mcp.create_file", tool_call_id="c3", arguments={})
     decision = await guard.pre_tool_call(None, denied)
     assert decision is not None and decision.kind == "skip"
+    geo_ok = agents.hook.PreToolCall(turn_id="t", tool_name="list_prompts", tool_id="connector_mentionable_c938.list_prompts", tool_call_id="c4", arguments={})
+    assert await guard.pre_tool_call(None, geo_ok) is None
+    geo_get = agents.hook.PreToolCall(turn_id="t", tool_name="get_recommendation", tool_id="connector_mentionable_c938.get_recommendation", tool_call_id="c5", arguments={})
+    assert await guard.pre_tool_call(None, geo_get) is None
+    for bad in ("create_prompts", "update_project_settings", "set_recommendation_status", "merge_products"):
+        geo_denied = agents.hook.PreToolCall(turn_id="t", tool_name=bad, tool_id=f"connector_mentionable_c938.{bad}", tool_call_id="c6", arguments={})
+        decision2 = await guard.pre_tool_call(None, geo_denied)
+        assert decision2 is not None and decision2.kind == "skip", bad
+    run_ts = agents.hook.PreToolCall(turn_id="t", tool_name="run_typescript", tool_id="run_typescript", tool_call_id="c7", arguments={})
+    decision3 = await guard.pre_tool_call(None, run_ts)
+    assert decision3 is not None and decision3.kind == "skip"
     print("guardrail tests: OK")
 
 
