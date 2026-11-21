@@ -117,7 +117,7 @@ class Aggregation(BaseModel):
     )
 
 
-@agents.tool(model_access="direct", annotations=agents.ToolAnnotations(read_only_hint=True))
+@agents.tool(model_access="both", annotations=agents.ToolAnnotations(read_only_hint=True))
 def load_csv(
     ctx: agents.ToolCallbackContext,
     /,
@@ -134,9 +134,14 @@ def load_csv(
     raw = csv_text
     if raw is None:
         try:
-            raw = base64.b64decode(base64_content, validate=True).decode("utf-8", errors="replace")
+            compact = "".join(base64_content.split())
+            compact += "=" * (-len(compact) % 4)
+            raw = base64.b64decode(compact).decode("utf-8", errors="replace")
         except (binascii.Error, ValueError):
-            raise agents.ToolError("base64_content invalide : passe exactement le champ 'content' renvoye par download_file_content.")
+            raise agents.ToolError(
+                "base64_content invalide ou tronque : enchaine de preference download_file_content et load_csv "
+                "dans un meme programme run_typescript en passant le champ 'content' du resultat tel quel."
+            )
     raw = raw.lstrip("\ufeff")
     if len(raw) > MAX_CSV_CHARS:
         raise agents.ToolError(f"Fichier trop grand : {len(raw)} caracteres, maximum {MAX_CSV_CHARS}. Demande a l'utilisateur un extrait.")
@@ -450,7 +455,7 @@ CAPACITES FIXES (tu n'as aucun outil d'execution de code, et tu ne dois jamais e
 - group_aggregate : calcule des agregats (count, count_distinct, sum, avg, min, max) par groupe de colonnes.
 
 PROTOCOLE :
-1. Quand l'utilisateur te donne un lien Drive (https://drive.google.com/file/d/<ID>/view?..., ou open?id=<ID>, ou un dossier), extrais l'identifiant du fichier. Appelle get_file_metadata(file_id=<ID>) pour verifier le titre, puis download_file_content(file_id=<ID>) pour recuperer le contenu. Passe alors le champ 'content' renvoye (base64) a load_csv(base64_content=..., source_name=<titre du fichier>). Si le lien ne contient pas d'ID, retrouve le fichier avec search_files (ex. query "title contains '<morceau du nom>' and mimeType contains 'csv'") puis get_file_metadata/download_file_content sur l'ID trouve ; si plusieurs fichiers correspondent, choisis le plus recent (modified_time) et dis lequel tu as choisi.
+1. Quand l'utilisateur te donne un lien Drive (https://drive.google.com/file/d/<ID>/view?..., ou open?id=<ID>, ou un dossier), extrais l'identifiant du fichier. Le chargement se fait DE PREFERENCE en un seul programme run_typescript qui enchaine les deux appels sans que tu recopies le contenu a la main : appelle d'abord download_file_content({file_id: '<ID>'}) (tu peux appeler get_file_metadata({file_id: '<ID>'}) avant pour verifier le titre), puis appelle load_csv en passant directement le resultat : tools.client.load_csv({source_name: <titre>, base64_content: <result.content>}). Ne recopie jamais la longue chaine base64 a la main dans un appel direct (risque d'erreur de copie) ; load_csv accepte le champ 'content' tel quel (base64). Si le lien ne contient pas d'ID, retrouve le fichier avec search_files (ex. query "title contains '<morceau du nom>' and mimeType contains 'csv'") puis download_file_content sur l'ID trouve ; si plusieurs fichiers correspondent, choisis le plus recent (modified_time) et dis lequel tu as choisi.
 2. Ensuite, reponds aux questions UNIQUEMENT a l'aide de describe_columns, filter_rows et group_aggregate sur le CSV charge. N'invente jamais un chiffre : si tu n'as pas calcule une valeur avec un outil, ne la donne pas. Pour une question du type "combien de X", "moyenne de Y par Z", "les lignes ou ...", traduis-la en appels d'outils filtres/agregats, puis formule la reponse.
 3. Reponds en francais, de maniere concise et structuree, avec des tableaux Markdown quand c'est pertinent. Mentionne les colonnes/filtres utilises et le nombre de lignes concernees.
 

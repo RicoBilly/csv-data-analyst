@@ -10,7 +10,7 @@ The user gives a link to a CSV file in their Google Drive and asks natural-langu
 - `filter_rows` — row filtering (`eq`, `ne`, `gt`, `ge`, `lt`, `le`, `contains`, `startswith`, `in`, `is_null`, `is_not_null`)
 - `group_aggregate` — per-group aggregates (`count`, `count_distinct`, `sum`, `avg`, `min`, `max`)
 
-**No arbitrary code execution**: the agent runs with the default `NoSandbox` (no computer is provisioned — no shell, no files, no TypeScript runtime), all custom tools in `model_access="direct"`, and a guardrail (`ReadOnlyGuardrail`) that skips any tool other than the five CSV tools and the read-only Google Drive tools — including `run_typescript`/`search_tool_functions` if they were ever exposed. The connector only forces `programmatic_tool_calling` in the config encoding; with `NoSandbox` there is nothing to execute programs on.
+**No arbitrary code execution**: the agent runs with the default `NoSandbox` — no computer is provisioned, so no shell, no filesystem, no network and no Python for model-written code (the only `run_typescript` programs that can run are restricted tool-call chains with no IO, e.g. `download_file_content` → `load_csv` passing the result through untouched). On top of that, a guardrail (`ReadOnlyGuardrail`) skips any tool call other than the five CSV tools (`client.*`) and the six read-only Google Drive tools — write tools (`create_file`, `update_file`, `copy_file`) and anything else are refused before execution. The Drive connector only forces `programmatic_tool_calling` in the config encoding; it cannot turn into real code execution without an executable sandbox.
 
 Sessions are durable on Mistral Cloud, so follow-up questions in the same conversation remember the loaded file and everything discussed.
 
