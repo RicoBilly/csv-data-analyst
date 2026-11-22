@@ -1,20 +1,31 @@
 """POC lecture seule : rapport a blanc du plan de relance des factures clients Pennylane.
 
-L'agent lit les factures clients (dates d'emission, echeances, paiements, clients) via le
-connecteur Pennylane, applique les regles de relance (J = date d'echeance ; seuils
-J+15 / J+30 / J+45 / J+60 / J+90 ; exclusion de la 1re relance quand date d'emission =
-date d'echeance) de facon deterministe via l'outil compute_relance_report, et produit un
-rapport markdown. Aucun envoi, aucune ecriture : le garde-fou bloque tout outil non
-autorise.
+L'agent lit les factures clients (dates d'emission, echeances, paiements, clients) :
+- via l'API Company v2 (outil fetch_pennylane_customer_invoices, token lu depuis la
+  variable d'environnement PENNYLANE_API_TOKEN injectee par le deploiement a partir du
+  secret workspace ; le token n'est jamais un argument ni affiche), quand le MCP
+  renvoie des 500 sur les endpoints factures ;
+- via le connecteur MCP Pennylane en secours (comptes 411, clients, paiements).
+Il applique les regles de relance (J = date d'echeance ; seuils J+15 / J+30 / J+45 /
+J+60 / J+90 ; exclusion de la 1re relance quand date d'emission = date d'echeance) de
+facon deterministe via l'outil compute_relance_report, et produit un rapport markdown.
+Aucun envoi, aucune ecriture : le garde-fou bloque tout outil non autorise.
 """
 
 import json
+import os
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import date, datetime
 from typing import Any
 
 from mistralai import agents
 
 PENNYLANE_PREFIX = "connector_pennylane_e376."
+PENNYLANE_API_BASE = "https://app.pennylane.com/api/external/v2"
+API_TOKEN_ENV = "PENNYLANE_API_TOKEN"
 
 # Outils curates officiels du MCP Pennylane (allow-list 100% lecture seule cote serveur) :
 # https://pennylane-mcp.readme.io/docs/getting-started
@@ -342,6 +353,137 @@ def compute_encours_report(accounts_json: str, customers_json: str, payments_jso
     }
 
 
+def _api_v2_get(path: str, params: dict[str, Any], company_id: int) -> dict[str, Any]:
+    """GET sur l'API Company v2 Pennylane. Le token vient UNIQUEMENT de l'env."""
+    token = os.environ.get(API_TOKEN_ENV, "").strip()
+    if not token:
+        raise agents.ToolError(
+            f"Variable d'environnement {API_TOKEN_ENV} absente : le secret workspace "
+            "(cle_api_pennylane) n'est pas injecte dans ce deploiement."
+        )
+    query = urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")})
+    url = f"{PENNYLANE_API_BASE}{path}" + (f"?{query}" if query else "")
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "X-Company-Id": str(company_id),
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:300]
+        raise agents.ToolError(f"API Pennylane v2 {path} -> HTTP {e.code}: {body}")
+    except urllib.error.URLError as e:
+        raise agents.ToolError(f"API Pennylane v2 {path} injoignable: {e.reason}")
+
+
+SKIP_STATUSES = {"draft", "credit_note", "cancelled", "partially_cancelled", "archived"}
+
+
+def _map_v2_invoice(item: dict[str, Any], cust_by_id: dict[int, dict[str, Any]]) -> dict[str, Any] | None:
+    """Mappe une facture API v2 vers les alias attendus par compute_relance_report."""
+    status = item.get("status") or ""
+    if status in SKIP_STATUSES or item.get("draft") or item.get("credit_note"):
+        return None
+    amount = _to_float(item.get("currency_amount") or item.get("amount"))
+    remaining = item.get("remaining_amount_with_tax")
+    if item.get("paid"):
+        amount_paid = amount
+    elif remaining is not None:
+        amount_paid = round(amount - _to_float(remaining), 2)
+    else:
+        amount_paid = 0.0
+    customer = item.get("customer") or {}
+    cust = cust_by_id.get(customer.get("id"), {})
+    emails = cust.get("emails") or ([cust["email"]] if cust.get("email") else [])
+    return {
+        "invoice_id": item.get("id"),
+        "number": item.get("invoice_number") or item.get("label"),
+        "customer_id": customer.get("id"),
+        "customer_name": cust.get("name") or f"client {customer.get('id')}",
+        "customer_email": emails[0] if emails else None,
+        "date": item.get("date"),
+        "deadline": item.get("deadline"),
+        "currency": item.get("currency") or "EUR",
+        "amount": item.get("currency_amount") or item.get("amount"),
+        "amount_paid": amount_paid,
+        "status": status,
+    }
+
+
+@agents.tool
+def fetch_pennylane_customer_invoices(company_id: int, max_pages: int = 40) -> dict[str, Any]:
+    """Lit les factures clients Pennylane via l'API Company v2 (lecture seule, GET uniquement).
+
+    company_id : identifiant Pennylane de l'entreprise (fourni par l'utilisateur, ex.
+        21994007), transmis en header X-Company-Id.
+    max_pages : nombre max de pages de 100 factures (securite, defaut 40 = 4000 factures).
+
+    Le token API est lu automatiquement depuis la variable d'environnement
+    PENNYLANE_API_TOKEN (secret workspace injecte au deploiement) : ne JAMAIS le passer
+    en argument et ne jamais l'afficher. Appels effectues (GET, aucune ecriture) :
+    GET /api/external/v2/customer_invoices?limit=100&filter=[draft=false, credit_note=false]
+    pagine par cursor, puis GET /api/external/v2/customers pagine pour les noms/emails.
+
+    Retourne un dict : invoices_count, customers_count, source="pennylane_api_v2" et
+    invoices_json (liste JSON prete pour compute_relance_report : invoice_id, number,
+    customer_id, customer_name, customer_email, date, deadline, currency, amount,
+    amount_paid, status).
+    """
+    if not isinstance(company_id, int) or company_id <= 0:
+        raise agents.ToolError("company_id doit etre un entier positif (ex. 21994007).")
+
+    cust_by_id: dict[int, dict[str, Any]] = {}
+    try:
+        cursor = None
+        for _ in range(20):
+            params = {"limit": 100, "cursor": cursor}
+            data = _api_v2_get("/customers", params, company_id)
+            for c in data.get("items", []):
+                if c.get("id") is not None:
+                    cust_by_id[c["id"]] = c
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+            time.sleep(0.3)
+    except agents.ToolError:
+        cust_by_id = {}
+
+    invoices: list[dict[str, Any]] = []
+    cursor = None
+    pages = 0
+    flt = json.dumps([
+        {"field": "draft", "operator": "eq", "value": "false"},
+        {"field": "credit_note", "operator": "eq", "value": "false"},
+    ])
+    while pages < max_pages:
+        params = {"limit": 100, "cursor": cursor, "filter": flt, "sort": "-id"}
+        data = _api_v2_get("/customer_invoices", params, company_id)
+        pages += 1
+        for item in data.get("items", []):
+            mapped = _map_v2_invoice(item, cust_by_id)
+            if mapped is not None:
+                invoices.append(mapped)
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+        time.sleep(0.3)
+
+    return {
+        "company_id": company_id,
+        "source": "pennylane_api_v2",
+        "pages_fetched": pages,
+        "invoices_count": len(invoices),
+        "customers_count": len(cust_by_id),
+        "invoices_json": json.dumps(invoices, ensure_ascii=False),
+    }
+
+
 class ReadOnlyPennylaneGuardrail(agents.Hook):
     """N'autorise que les outils Pennylane curates en lecture seule et les outils client.*.
 
@@ -382,52 +524,41 @@ class ReadOnlyPennylaneGuardrail(agents.Hook):
 
 INSTRUCTIONS = """Tu es le responsable des encaissements de l'agence. Tu reponds en francais.
 
-OBJECTIF DE CE POC (100% LECTURE SEULE) : produire un RAPPORT A BLANC sur les creances
-clients en retard dans Pennylane (company_id fourni par l'utilisateur). Tu n'envoies
-rien, tu ne crees rien, tu ne modifies rien : le garde-fou bloque toute ecriture.
+OBJECTIF DE CE POC (100% LECTURE SEULE) : produire un RAPPORT A BLANC du plan de relance
+des factures clients en retard dans Pennylane (company_id fourni par l'utilisateur).
+Tu n'envoies rien, tu ne crees rien, tu ne modifies rien : le garde-fou bloque toute
+ecriture et tout outil hors connecteur Pennylane (lecture seule) + outils client.*.
 
-CONNECTEUR PENNYLANE (pennylane_e376) - LECTURE SEULE :
-- Tous les outils curates nommes list_*, get_* ou query_* sont autorises (allow-list
-  100% lecture seule cote serveur Pennylane).
-- DIAGNOSTIC CONNU pour cette entreprise (sonde realisee le 2026-11-22) — certains
-  endpoints renvoient une erreur 500 "Error calling tool from MCP server" :
-  list_customer_invoices (des qu'il y a des resultats), get_customer_invoice,
-  search_operations (toujours), list_transactions, query_trial_balance,
-  list_ledger_entry_lines non filtre, get_context sans company_id.
-  NE RETENTE PAS ces outils plus d'une fois chacun. NE PAS appeler run_operations avec
-  des operation_id inventes ("getCustomerInvoices" -> "Opération inconnue").
-- OUTILS QUI FONCTIONNENT (a utiliser) : get_company, list_customers, get_customer,
-  list_customer_payments, list_accounts (number_prefix="411"), get_changelog.
+SOURCE DE DONNEES PRINCIPALE - API Company v2 (le MCP renvoie des 500 sur les endpoints
+factures pour cette entreprise, sonde du 2026-11-22) :
+- L'outil client.fetch_pennylane_customer_invoices(company_id=<id>) appelle l'API v2 en
+  GET uniquement (factures + clients), lit le token dans son environnement, pagine tout
+  seul et retourne invoices_json directement utilisable. NE lui passe JAMAIS de token.
 
 PROTOCOLE :
 1. company_id : prends-le dans le message de l'utilisateur (nombre entier, ex.
-   "company_id: 21994007") — NE PAS deviner. Appelle get_company(company_id=<id>) pour
-   confirmer le profil.
-2. ENCOURS CLIENTS (niveau compte 411) : list_accounts(company_id=<id>,
-   number_prefix="411", page=1) puis pagine (pagination.total, ~932 comptes, 10 pages)
-   en gardant tous les comptes. Champs : number, label, total_balance (solde debiteur =
-   creance restante), total_debits, total_credits. Une requete a la fois.
-3. CLIENTS : list_customers(company_id=<id>, page=1, per_page=100) en paginant
-   (pagination.total, ~645 clients, 7 pages). Champs : id, name, emails, ...
-   Le rapprochement compte 411 <-> client se fait sur le NOM (label du compte =
-   nom du client).
-4. PAIEMENTS : list_customer_payments(company_id=<id>, page=1) en paginant
-   (pagination.total, ~131 paiements, 2 pages). Champs : id, date, customer_id,
-   customer_name, invoice_id, amount, currency, method, status.
-5. OPTIONNEL (une seule fois) : teste list_ledger_entry_lines(company_id=<id>,
-   account_filter="411", period_start="2026-01-01", page=1). Si 200, pagine jusqu'a
-   ~20 pages et reconstruis les factures (lignes document_type=CustomerInvoice :
-   description = numero de facture, date, amount>0 = debit, lettering_balance != 0 =
-   non soldee) ; deadline estimee = date + payment_conditions du client (ex.
-   "30_days" -> 30 jours, valeur par defaut 30) ; puis appelle compute_relance_report
-   avec cette liste. Si 500, abandonne cette etape (les encours restent valides).
-6. Appelle compute_encours_report(accounts_json=<liste JSON des comptes 411>,
-   customers_json=<liste JSON des clients>, payments_json=<liste JSON des paiements>,
-   today=<YYYY-MM-DD du jour>). Ne calcule rien toi-meme : laisse l'outil le faire.
-7. Ta reponse finale est UNIQUEMENT le rapport markdown retourne par l'outil (champ
-   report_markdown ; si l'etape 5 a reussi, prefere le report_markdown de
-   compute_relance_report), suivi d'une phrase indiquant qu'aucun envoi n'a ete
-   effectue (POC lecture seule).
+   "company_id: 21994007") — NE PAS deviner.
+2. Appelle fetch_pennylane_customer_invoices(company_id=<id>). Lis le resultat :
+   invoices_count, pages_fetched, invoices_json.
+3. Appelle compute_relance_report(invoices_json=<champ invoices_json du resultat de
+   l'etape 2>, today=<YYYY-MM-DD du jour>). Ne calcule rien toi-meme.
+4. Ta reponse finale est UNIQUEMENT le report_markdown retourne par
+   compute_relance_report, suivi de la phrase "Aucun envoi effectue (POC lecture seule)."
+
+FALLBACK (uniquement si l'etape 2 echoue, ex. 401/403/429 ou reseau) :
+a. list_accounts(company_id=<id>, number_prefix="411", page=1..N) en paginant
+   (pagination.total ~932 comptes, 10 pages) ; b. list_customers(company_id=<id>,
+   page=1..N, per_page=100) (~645 clients, 7 pages) ; c. list_customer_payments(
+   company_id=<id>, page=1..N) (~131 paiements, 2 pages) ; d. compute_encours_report(
+   accounts_json=..., customers_json=..., payments_json=..., today=...) ; e. reponse =
+   report_markdown de compute_encours_report + "Aucun envoi effectue (POC lecture seule)."
+   + une phrase indiquant que le plan facture par facture (J+15..J+90) n'a pas pu etre
+   calcule car l'API v2 a echoue.
+- NE TENTE PAS list_customer_invoices / get_customer_invoice / search_operations /
+  run_operations / list_ledger_entry_lines non filtre : 500 ou "Operation inconnue" pour
+  cette entreprise (sonde du 2026-11-22). Un seul essai maximum par outil en fallback.
+- Outils MCP qui fonctionnent : get_company, list_customers, get_customer,
+  list_customer_payments, list_accounts, get_changelog.
 
 REGLES METIER (appliquees par l'outil compute_relance_report) :
 - J = date d'echeance (date de paiement demande), pas la date d'emission.
@@ -438,8 +569,8 @@ REGLES METIER (appliquees par l'outil compute_relance_report) :
   sujette a la 1re relance.
 - Ne jamais relancer une facture deja soldee (reste du = 0).
 
-ERREURS : si un outil renvoie une erreur, lis le message, corrige l'appel (pagination,
-parametres) ou explique clairement le probleme. Ne devine jamais un montant ni une date.
+ERREURS : si un outil renvoie une erreur, lis le message et explique clairement le
+probleme. Ne devine jamais un montant ni une date. Ne jamais afficher de token/cles.
 """
 
 agent = agents.Agent(
@@ -447,7 +578,7 @@ agent = agents.Agent(
     name="relance-factures-poc",
     description="POC lecture seule : lit les factures clients impayees dans Pennylane (connexion de l'utilisateur) et produit un rapport a blanc du plan de relance J+15/30/45/60/90. Aucun envoi.",
     instructions=INSTRUCTIONS,
-    tools=[compute_relance_report, compute_encours_report],
+    tools=[compute_relance_report, compute_encours_report, fetch_pennylane_customer_invoices],
     connectors=[agents.connector("pennylane_e376")],
     builtins=agents.Builtins(skills=False, subagents=False),
     guardrails=[ReadOnlyPennylaneGuardrail()],

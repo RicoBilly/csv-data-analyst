@@ -2,11 +2,12 @@
 
 import asyncio
 import json
+import os
 
 from mistralai import agents
 
 import main
-from main import ReadOnlyPennylaneGuardrail, compute_encours_report, compute_relance_report
+from main import ReadOnlyPennylaneGuardrail, compute_encours_report, compute_relance_report, fetch_pennylane_customer_invoices
 
 TODAY = "2026-11-22"
 
@@ -112,6 +113,77 @@ def test_compute_encours() -> None:
     print("compute_encours_report tests: OK")
 
 
+def test_fetch_api_v2_tool() -> None:
+    os.environ[main.API_TOKEN_ENV] = "dummy-token-never-printed"
+    try:
+        pages = {
+            ("/customers", None): {"items": [
+                {"id": 7, "name": "ACME", "emails": ["a@acme.fr"]},
+                {"id": 8, "name": "BETA", "email": "b@beta.fr"},
+            ], "has_more": False},
+            ("/customer_invoices", None): {"items": [
+                {"id": 1, "invoice_number": "FA-1", "date": "2026-09-01", "deadline": "2026-10-01",
+                 "currency": "EUR", "currency_amount": "1000.00", "remaining_amount_with_tax": "400.00",
+                 "paid": False, "status": "late", "draft": False, "customer": {"id": 7}},
+                {"id": 2, "invoice_number": "FA-2", "date": "2026-09-01", "deadline": "2026-09-01",
+                 "currency": "EUR", "currency_amount": "250.00", "remaining_amount_with_tax": None,
+                 "paid": True, "status": "paid", "draft": False, "customer": {"id": 8}},
+                {"id": 3, "invoice_number": "ANN-1", "date": "2026-09-01", "deadline": "2026-10-01",
+                 "currency": "EUR", "currency_amount": "50.00", "status": "cancelled", "customer": {"id": 7}},
+                {"id": 4, "invoice_number": "BROUILLON", "status": "draft", "draft": True, "customer": {"id": 7}},
+            ], "has_more": True, "next_cursor": "c2"},
+            ("/customer_invoices", "c2"): {"items": [
+                {"id": 5, "invoice_number": "FA-5", "date": "2026-10-20", "deadline": "2026-11-06",
+                 "currency": "EUR", "currency_amount": "80.00", "remaining_amount_with_tax": "80.00",
+                 "paid": False, "status": "upcoming", "draft": False, "customer": {"id": 8}},
+            ], "has_more": False},
+        }
+        calls = []
+
+        def fake_get(path, params, company_id):
+            calls.append((path, params.get("cursor"), company_id, dict(params)))
+            key = (path, params.get("cursor"))
+            if key not in pages:
+                raise AssertionError(f"unexpected call {key}")
+            return pages[key]
+
+        orig_get = main._api_v2_get
+        main._api_v2_get = fake_get
+        try:
+            out = fetch_pennylane_customer_invoices(21994007)
+        finally:
+            main._api_v2_get = orig_get
+        assert out["source"] == "pennylane_api_v2" and out["pages_fetched"] == 2
+        assert out["customers_count"] == 2 and out["invoices_count"] == 3
+        invs = {i["number"]: i for i in json.loads(out["invoices_json"])}
+        assert set(invs) == {"FA-1", "FA-2", "FA-5"}
+        assert invs["FA-1"]["amount_paid"] == 600.0 and invs["FA-1"]["customer_email"] == "a@acme.fr"
+        assert invs["FA-2"]["amount_paid"] == 250.0 and invs["FA-2"]["customer_email"] == "b@beta.fr"
+        assert invs["FA-5"]["amount_paid"] == 0.0 and invs["FA-5"]["deadline"] == "2026-11-06"
+        assert all(c[2] == 21994007 for c in calls)
+        filter_arg = [c[3]["filter"] for c in calls if c[0] == "/customer_invoices"][0]
+        assert "draft" in filter_arg and "credit_note" in filter_arg
+        report = compute_relance_report(out["invoices_json"], today="2026-11-22")
+        nums = {e["number"]: e for e in report["items"]}
+        assert nums["FA-1"]["stage"]["level"] == 3 and nums["FA-1"]["days_late"] == 52 and nums["FA-1"]["amount_due"] == 400.0
+        assert "FA-2" not in nums
+        assert nums["FA-5"]["stage"]["level"] == 1 and nums["FA-5"]["days_late"] == 16
+
+        try:
+            fetch_pennylane_customer_invoices(0)
+            raise AssertionError("should have raised")
+        except agents.ToolError as e:
+            assert "entier positif" in str(e)
+    finally:
+        del os.environ[main.API_TOKEN_ENV]
+    try:
+        fetch_pennylane_customer_invoices(21994007)
+        raise AssertionError("should have raised")
+    except agents.ToolError as e:
+        assert main.API_TOKEN_ENV in str(e) and "dummy" not in str(e)
+    print("fetch_pennylane_customer_invoices tests: OK")
+
+
 async def test_guardrail() -> None:
     guard = ReadOnlyPennylaneGuardrail()
 
@@ -137,6 +209,7 @@ async def test_guardrail() -> None:
         None, call("run_operations", "connector_pennylane_e376.run_operations", {"operation_id": "getCustomerInvoices"})
     ) is None
     assert await guard.pre_tool_call(None, call("compute_relance_report", "client.compute_relance_report")) is None
+    assert await guard.pre_tool_call(None, call("fetch_pennylane_customer_invoices", "client.fetch_pennylane_customer_invoices", {"company_id": 21994007})) is None
 
     for name, args in [
         ("run_operations", {"operation_id": "sendByEmailCustomerInvoice"}),
@@ -192,5 +265,6 @@ if __name__ == "__main__":
     test_compute_report()
     test_compute_validation()
     test_compute_encours()
+    test_fetch_api_v2_tool()
     asyncio.run(main_async())
     print("ALL LOCAL CHECKS PASSED")
