@@ -289,36 +289,44 @@ CONNECTEUR PENNYLANE (pennylane_e376) - LECTURE SEULE :
 - Tous les outils curates nommes list_*, get_* ou query_* sont autorises (allow-list
   100% lecture seule cote serveur Pennylane) : notamment list_customer_invoices,
   get_customer_invoice, list_customer_payments, list_customers, get_customer,
-  get_company, get_context, list_transactions, query_trial_balance.
-- search_operations / run_operations : DERNIER RECOURS uniquement (search_operations
-  renvoie souvent une erreur 500). run_operations n'est autorise que pour des operations
-  en LECTURE (GET) : ne l'utilise JAMAIS pour envoyer, creer, modifier ou supprimer quoi
+  get_company, list_transactions, query_trial_balance.
+- search_operations / run_operations : utilisables UNIQUEMENT en LECTURE (GET) — c'est
+  le chemin de repli nominal quand un outil curate tombe en panne (voir etape 2).
+  run_operations n'est JAMAIS autorise pour envoyer, creer, modifier ou supprimer quoi
   que ce soit (le garde-fou bloque toute operation d'ecriture).
+- NE PAS appeler get_context sans company_id ni search_operations sans company_id :
+  les deux renvoient une erreur 500.
 
 PROTOCOLE :
 1. company_id : si le message de l'utilisateur contient explicitement un company_id
-   (nombre entier, ex. "company_id: 123456"), utilise-le directement. Sinon, essaie
-   get_context sans argument pour le mode decouverte (il peut echouer avec une erreur
-   500 : dans ce cas demande le company_id a l'utilisateur et arrete-toi). NE PAS
-   appeler search_operations sans company_id (erreur 500). NE PAS deviner de company_id.
-   Ensuite appelle get_company(company_id=<id>) pour le profil complet si besoin.
-2. Liste les factures clients avec company_id=<id> en utilisant DIRECTEMENT l'outil
-   curate list_customer_invoices(company_id=<id>, page=1, per_page=100, ...) en paginant
-   jusqu'au bout (champ pagination). Filtre TOI-MEME, client-side, les resultats : ne
-   retiens que les factures non soldees (payment_status different de "paid" / reste du
-   > 0) dont la deadline (date d'echeance) est anterieure a aujourd'hui. Respecte les
-   rate limits (~2 req/s sur customer_invoices) : une requete a la fois, pas de rafale.
-   N'utilise PAS search_operations pour lister les factures (erreurs 500 frequentelles).
-3. Pour chaque facture retenue : get_customer_invoice(company_id=<id>, invoice_id=<id>)
-   renvoie l'en-tete, les lignes, la TVA, les paiements (payments) et avoirs associes,
-   ainsi que accountants_status et payment_status (collection) ; list_customer_payments
-   (company_id=<id>, ...) liste les paiements et les factures qu'ils soldent. Utilise ces
-   outils pour calculer le reste du exact de chaque facture. Appelle
-   get_customer(company_id=<id>, customer_id=<id>) (ou list_customers(company_id=<id>))
-   pour recuperer l'email du client et ses conditions de paiement. Si un outil curate
-   manque, utilise run_operations UNIQUEMENT avec un operation_id de lecture (GET)
-   trouve via search_operations(company_id=<id>, verb="GET") — et abandonne vite en cas
-   d'erreur 500.
+   (nombre entier, ex. "company_id: 21994007"), utilise-le directement — NE PAS deviner.
+   Appelle get_company(company_id=<id>) pour confirmer le profil (cet outil fonctionne).
+2. FACTURES CLIENTS — contournement connu : pour cette entreprise, l'outil curate
+   list_customer_invoices renvoie une erreur 500 des qu'il y a des resultats (bug de
+   serialisation cote serveur Pennylane ; un appel avec un filtre ne matchant rien,
+   ex. label="__vide__", repond OK avec total=0). get_customer_invoice fait de meme.
+   NE RETENTE PAS ces deux outils plus d'une fois chacun.
+   Chemin nominal : la paire search_operations / run_operations en LECTURE :
+   a. search_operations(company_id=<id>, query="customer invoices", verb="GET") ;
+      si total=0 ou erreur 500, essaie query="invoice" puis controller="customer_invoices".
+   b. Dans les operations retournees, choisis l'operation GET de LISTE des factures
+      clients (ex. getCustomerInvoices) et lis son inputSchema : il decrit exactement
+      les path_params / query_params a passer (souvent path_params={"company_id": <id>}
+      et query_params avec pagination page/per_page ou limit/offset).
+   c. run_operations(operation_id=<ce nom>, path_params={"company_id": <id>},
+      query_params={... selon inputSchema ...}) en paginant jusqu'au bout (champ
+      pagination / total). Respecte les rate limits (~2 req/s sur customer_invoices) :
+      une requete a la fois.
+   d. Filtre TOI-MEME, client-side : ne retiens que les factures non soldees
+      (payment_status / paid / reste du > 0) dont la deadline (date d'echeance) est
+      anterieure a aujourd'hui.
+3. PAIEMENTS ET CLIENTS — outils curates qui FONCTIONNENT pour cette entreprise :
+   - list_customer_payments(company_id=<id>, page=1, ...) en paginant : chaque paiement
+     a id, date, customer_id, customer_name, invoice_id, amount, currency, method, status.
+     Somme les paiements par invoice_id pour calculer le reste du de chaque facture.
+   - list_customers(company_id=<id>, page=1, per_page=100, ...) en paginant (champ
+     pagination.total) ou get_customer(company_id=<id>, customer_id=<id>) pour les
+     emails (champ emails) et les conditions de paiement de chaque client.
 4. Construis une liste JSON d'objets {invoice_id, number, customer_id, customer_name,
    customer_email, date, deadline, currency, amount, amount_paid, status} et appelle
    compute_relance_report(invoices_json=<la liste JSON>, today=<YYYY-MM-DD du jour>).
@@ -348,5 +356,5 @@ agent = agents.Agent(
     connectors=[agents.connector("pennylane_e376")],
     builtins=agents.Builtins(skills=False, subagents=False),
     guardrails=[ReadOnlyPennylaneGuardrail()],
-    max_iterations=40,
+    max_iterations=60,
 )
