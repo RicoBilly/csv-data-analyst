@@ -241,6 +241,107 @@ def compute_relance_report(invoices_json: str, today: str | None = None) -> dict
     }
 
 
+@agents.tool
+def compute_encours_report(accounts_json: str, customers_json: str, payments_json: str, today: str | None = None) -> dict[str, Any]:
+    """Rapport a blanc NIVEAU ENCOURS clients, calcule de facon deterministe.
+
+    Utilise quand l'endpoint factures est indisponible (erreurs 500 cote serveur MCP) :
+    l'encours de chaque client = solde debiteur (total_balance) de son compte 411.
+
+    accounts_json : liste JSON de comptes 411 {number, label, total_balance, ...}
+        retournes par list_accounts(number_prefix="411").
+    customers_json : liste JSON de clients {id, name, emails, ...} retournes par
+        list_customers. Le rapprochement compte <-> client se fait sur le nom (label).
+    payments_json : liste JSON de paiements {invoice_id, customer_id, customer_name,
+        amount, date, status, method} retournes par list_customer_payments.
+    today : date du jour YYYY-MM-DD (vide = date courante).
+
+    Retourne un dict avec le resume (total encours, nb clients debiteurs, paiements
+    recents) et un rapport markdown (champ report_markdown) listant les clients debiteurs
+    tries par encours decroissant avec leur email. AUCUNE action de relance n'est
+    effectuee : le plan facture par facture (J+15/J+30/J+45/J+60/J+90) necessite les
+    dates d'echeance des factures, indisponibles via le MCP pour cette entreprise.
+    """
+    accounts = json.loads(accounts_json)
+    customers = json.loads(customers_json)
+    payments = json.loads(payments_json)
+    if not isinstance(accounts, list) or not isinstance(customers, list) or not isinstance(payments, list):
+        raise agents.ToolError("accounts_json, customers_json et payments_json doivent etre des listes JSON.")
+    if today:
+        run_date = _parse_date(today)
+        if run_date is None:
+            raise agents.ToolError("today doit etre au format YYYY-MM-DD.")
+    else:
+        run_date = agents.now().date()
+
+    def norm(s: Any) -> str:
+        return " ".join(str(s or "").upper().split())
+
+    cust_by_name = {norm(c.get("name")): c for c in customers if c.get("name")}
+
+    debtors: list[dict[str, Any]] = []
+    for a in accounts:
+        balance = _to_float(a.get("total_balance"))
+        if balance <= 0.005:
+            continue
+        cust = cust_by_name.get(norm(a.get("label")), {})
+        emails = cust.get("emails") or []
+        debtors.append({
+            "account_number": a.get("number"),
+            "account_label": a.get("label"),
+            "customer_id": cust.get("id"),
+            "customer_name": cust.get("name") or a.get("label"),
+            "customer_email": emails[0] if emails else None,
+            "emails": emails,
+            "balance": round(balance, 2),
+        })
+    debtors.sort(key=lambda d: -d["balance"])
+    total_due = round(sum(d["balance"] for d in debtors), 2)
+
+    pay_total = round(sum(_to_float(p.get("amount")) for p in payments), 2)
+    pay_recent = [p for p in payments if (p.get("date") or "")[:10] >= "2026-10-01"]
+
+    lines = [
+        f"# Rapport a blanc des encours clients - {run_date.isoformat()}",
+        "",
+        "POC lecture seule : aucun envoi effectue, aucune donnee modifiee.",
+        "",
+        f"- Clients debiteurs (compte 411, solde > 0) : **{len(debtors)}**",
+        f"- Encours total : **{total_due:.2f} EUR**",
+        f"- Paiements clients lus : {len(payments)} (total {pay_total:.2f} EUR), dont {len(pay_recent)} depuis le 2026-10-01",
+        "",
+        "ATTENTION : le plan de relance facture par facture (J = echeance ; seuils J+15/J+30/J+45/J+60/J+90 ;",
+        "exclusion de la 1re relance si emission = echeance) N'est PAS calcule ici : les outils MCP",
+        "list_customer_invoices / get_customer_invoice / search_operations renvoient une erreur 500 pour",
+        "cette entreprise, donc les dates d'echeance facture par facture sont indisponibles via le MCP.",
+        "A calculer via l'API Company v2 (token) ou une fois le bug MCP corrige.",
+        "",
+    ]
+    if debtors:
+        lines += [
+            "| Compte 411 | Client | Email | Encours (EUR) |",
+            "|---|---|---|---|",
+        ]
+        for d in debtors:
+            lines.append(f"| {d['account_number']} | {d['customer_name']} | {d['customer_email'] or ''} | {d['balance']:.2f} |")
+        lines.append("")
+    if pay_recent:
+        lines += ["## Paiements clients recents (depuis 2026-10-01)", ""]
+        for p in sorted(pay_recent, key=lambda p: str(p.get("date")), reverse=True)[:30]:
+            lines.append(f"- {str(p.get('date'))[:10]} - {p.get('customer_name')} - facture {p.get('invoice_id')} - {p.get('amount')} {p.get('currency', 'EUR')} - {p.get('status')}")
+        lines.append("")
+
+    return {
+        "today": run_date.isoformat(),
+        "debtor_count": len(debtors),
+        "total_due": total_due,
+        "payments_count": len(payments),
+        "payments_total": pay_total,
+        "debtors": debtors,
+        "report_markdown": "\n".join(lines),
+    }
+
+
 class ReadOnlyPennylaneGuardrail(agents.Hook):
     """N'autorise que les outils Pennylane curates en lecture seule et les outils client.*.
 
@@ -281,75 +382,52 @@ class ReadOnlyPennylaneGuardrail(agents.Hook):
 
 INSTRUCTIONS = """Tu es le responsable des encaissements de l'agence. Tu reponds en francais.
 
-OBJECTIF DE CE POC (100% LECTURE SEULE) : produire un RAPPORT A BLANC du plan de relance
-des factures clients en retard dans Pennylane. Tu n'envoies rien, tu ne crees rien, tu ne
-modifies rien : le garde-fou bloque toute ecriture.
+OBJECTIF DE CE POC (100% LECTURE SEULE) : produire un RAPPORT A BLANC sur les creances
+clients en retard dans Pennylane (company_id fourni par l'utilisateur). Tu n'envoies
+rien, tu ne crees rien, tu ne modifies rien : le garde-fou bloque toute ecriture.
 
 CONNECTEUR PENNYLANE (pennylane_e376) - LECTURE SEULE :
 - Tous les outils curates nommes list_*, get_* ou query_* sont autorises (allow-list
-  100% lecture seule cote serveur Pennylane) : notamment list_customer_invoices,
-  get_customer_invoice, list_customer_payments, list_customers, get_customer,
-  get_company, list_transactions, query_trial_balance.
-- search_operations / run_operations : utilisables UNIQUEMENT en LECTURE. C'est le
-  chemin NOMINAL pour les factures (voir etape 2) car les outils curates factures
-  tombent en panne pour cette entreprise. run_operations n'est JAMAIS autorise pour
-  envoyer, creer, modifier ou supprimer quoi que ce soit (le garde-fou bloque toute
-  operation d'ecriture : send/post/create/update/delete/mark/finalize/...).
-- search_operations est actuellement en panne (erreur 500 sur presque toutes les
-  requetes, avec ou sans company_id) : NE L'UTILISE PAS, ou au plus 1 essai. Passe
-  directement a run_operations avec les operation_id connus ci-dessous.
-- NE PAS appeler get_context sans company_id (erreur 500).
+  100% lecture seule cote serveur Pennylane).
+- DIAGNOSTIC CONNU pour cette entreprise (sonde realisee le 2026-11-22) — certains
+  endpoints renvoient une erreur 500 "Error calling tool from MCP server" :
+  list_customer_invoices (des qu'il y a des resultats), get_customer_invoice,
+  search_operations (toujours), list_transactions, query_trial_balance,
+  list_ledger_entry_lines non filtre, get_context sans company_id.
+  NE RETENTE PAS ces outils plus d'une fois chacun. NE PAS appeler run_operations avec
+  des operation_id inventes ("getCustomerInvoices" -> "Opération inconnue").
+- OUTILS QUI FONCTIONNENT (a utiliser) : get_company, list_customers, get_customer,
+  list_customer_payments, list_accounts (number_prefix="411"), get_changelog.
 
 PROTOCOLE :
-1. company_id : si le message de l'utilisateur contient explicitement un company_id
-   (nombre entier, ex. "company_id: 21994007"), utilise-le directement — NE PAS deviner.
-   Appelle get_company(company_id=<id>) pour confirmer le profil (cet outil fonctionne).
-2. FACTURES CLIENTS — contournement connu : pour cette entreprise, list_customer_invoices
-   renvoie une erreur 500 sur les requetes NON FILTREES (trop volumineuses cote serveur ;
-   un filtre ne matchant rien, ex. label="__vide__", repond OK avec total=0), et
-   get_customer_invoice renvoie 500 lui aussi. search_operations est en panne (500) et
-   run_operations exige des operation_id internes inconnus ("getCustomerInvoices" et
-   "listCustomerInvoices" -> "Opération inconnue"). Strategie, dans l'ordre :
-   a. D'abord la liste des clients (outil qui fonctionne) : list_customers(
-      company_id=<id>, page=1, per_page=100) en paginant via pagination.total ->
-      collecte TOUS les customer ids (et leurs emails, utiles pour le rapport).
-   b. Teste UN filtre etroit sur les factures : list_customer_invoices(company_id=<id>,
-      page=1, customer_ids=[<id du premier client de la liste>]).
-      - Si reponse 200 avec des lignes : le filtrage par client fonctionne. Liste alors
-        les factures PAR LOT de clients : customer_ids=[...jusqu'a 50 ids...], page=1,
-        en paginant chaque lot (pagination.total / per_page / page). Une requete a la
-        fois (rate limit ~2 req/s sur customer_invoices). Si un lot renvoie 500,
-        decoupe-le en deux lots plus petits et reessaie.
-      - Si 500 aussi : passe a (c).
-   c. run_operations en lecture, UNE operation a la fois, avec path_params=
-      {"company_id": <id>} et query_params={"page": 1, "per_page": 100}, en testant
-      les operation_id candidats dans cet ordre : "list_customer_invoices",
-      "get_customer_invoices", "customer_invoices", "getCompanyCustomerInvoices",
-      "invoices". Si la reponse est "Opération inconnue", essaie le candidat suivant.
-      NE PAS appeler search_operations (500).
-   d. Dans tous les cas, filtre TOI-MEME client-side : ne retiens que les factures non
-      soldees (payment_status different de "paid", ou paid != true, ou
-      remaining_amount_with_tax > 0) dont la deadline (payment_deadline / deadline /
-      due_date) est anterieure a aujourd'hui. Champs usuels d'une facture : id, number,
-      date, payment_deadline, currency, amount_with_tax, remaining_amount_with_tax,
-      paid, status, customer_id.
-3. PAIEMENTS ET CLIENTS — outils curates qui FONCTIONNENT pour cette entreprise :
-   - list_customer_payments(company_id=<id>, page=1, ...) en paginant (champ
-     pagination) : chaque paiement a id, date, customer_id, customer_name, invoice_id,
-     amount, currency, method, status. Somme les paiements par invoice_id pour
-     verifier le reste du de chaque facture.
-   - list_customers(company_id=<id>, page=1, per_page=100, ...) en paginant (champ
-     pagination.total) ou get_customer(company_id=<id>, customer_id=<id>) pour les
-     emails (champ emails) et les conditions de paiement de chaque client.
-4. Construis une liste JSON d'objets {invoice_id, number, customer_id, customer_name,
-   customer_email, date, deadline, currency, amount, amount_paid, status} — mapping :
-   invoice_id=id, number=number, date=date, deadline=payment_deadline,
-   amount=amount_with_tax, amount_paid=amount_with_tax - remaining_amount_with_tax
-   (ou somme des paiements list_customer_payments), status=status — puis appelle
-   compute_relance_report(invoices_json=<la liste JSON>, today=<YYYY-MM-DD du jour>).
-   Ne calcule JAMAIS les jours de retard ou les etapes toi-meme : laisse l'outil le faire.
-5. Ta reponse finale est UNIQUEMENT le rapport markdown retourne par l'outil (champ
-   report_markdown), suivi d'une phrase indiquant qu'aucun envoi n'a ete effectue (POC).
+1. company_id : prends-le dans le message de l'utilisateur (nombre entier, ex.
+   "company_id: 21994007") — NE PAS deviner. Appelle get_company(company_id=<id>) pour
+   confirmer le profil.
+2. ENCOURS CLIENTS (niveau compte 411) : list_accounts(company_id=<id>,
+   number_prefix="411", page=1) puis pagine (pagination.total, ~932 comptes, 10 pages)
+   en gardant tous les comptes. Champs : number, label, total_balance (solde debiteur =
+   creance restante), total_debits, total_credits. Une requete a la fois.
+3. CLIENTS : list_customers(company_id=<id>, page=1, per_page=100) en paginant
+   (pagination.total, ~645 clients, 7 pages). Champs : id, name, emails, ...
+   Le rapprochement compte 411 <-> client se fait sur le NOM (label du compte =
+   nom du client).
+4. PAIEMENTS : list_customer_payments(company_id=<id>, page=1) en paginant
+   (pagination.total, ~131 paiements, 2 pages). Champs : id, date, customer_id,
+   customer_name, invoice_id, amount, currency, method, status.
+5. OPTIONNEL (une seule fois) : teste list_ledger_entry_lines(company_id=<id>,
+   account_filter="411", period_start="2026-01-01", page=1). Si 200, pagine jusqu'a
+   ~20 pages et reconstruis les factures (lignes document_type=CustomerInvoice :
+   description = numero de facture, date, amount>0 = debit, lettering_balance != 0 =
+   non soldee) ; deadline estimee = date + payment_conditions du client (ex.
+   "30_days" -> 30 jours, valeur par defaut 30) ; puis appelle compute_relance_report
+   avec cette liste. Si 500, abandonne cette etape (les encours restent valides).
+6. Appelle compute_encours_report(accounts_json=<liste JSON des comptes 411>,
+   customers_json=<liste JSON des clients>, payments_json=<liste JSON des paiements>,
+   today=<YYYY-MM-DD du jour>). Ne calcule rien toi-meme : laisse l'outil le faire.
+7. Ta reponse finale est UNIQUEMENT le rapport markdown retourne par l'outil (champ
+   report_markdown ; si l'etape 5 a reussi, prefere le report_markdown de
+   compute_relance_report), suivi d'une phrase indiquant qu'aucun envoi n'a ete
+   effectue (POC lecture seule).
 
 REGLES METIER (appliquees par l'outil compute_relance_report) :
 - J = date d'echeance (date de paiement demande), pas la date d'emission.
@@ -369,7 +447,7 @@ agent = agents.Agent(
     name="relance-factures-poc",
     description="POC lecture seule : lit les factures clients impayees dans Pennylane (connexion de l'utilisateur) et produit un rapport a blanc du plan de relance J+15/30/45/60/90. Aucun envoi.",
     instructions=INSTRUCTIONS,
-    tools=[compute_relance_report],
+    tools=[compute_relance_report, compute_encours_report],
     connectors=[agents.connector("pennylane_e376")],
     builtins=agents.Builtins(skills=False, subagents=False),
     guardrails=[ReadOnlyPennylaneGuardrail()],

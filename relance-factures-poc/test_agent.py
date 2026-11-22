@@ -6,7 +6,7 @@ import json
 from mistralai import agents
 
 import main
-from main import ReadOnlyPennylaneGuardrail, compute_relance_report
+from main import ReadOnlyPennylaneGuardrail, compute_encours_report, compute_relance_report
 
 TODAY = "2026-11-22"
 
@@ -75,6 +75,41 @@ def test_compute_validation() -> None:
     empty = compute_relance_report("[]", today=TODAY)
     assert empty["overdue_count"] == 0 and empty["report_markdown"]
     print("compute_relance_report validation: OK")
+
+
+def test_compute_encours() -> None:
+    accounts = [
+        {"number": "411000010", "label": "BETA SARL", "total_balance": "1200.00"},
+        {"number": "411000002", "label": "2D AMENAGEMENT", "total_balance": "285.6"},
+        {"number": "411", "label": "ARCHIVE - Clients", "total_balance": "0.0"},
+        {"number": "411000099", "label": "CLIENT INCONNU DU CATALOGUE", "total_balance": "50.25"},
+    ]
+    customers = [
+        {"id": 1, "name": "2D AMENAGEMENT", "emails": ["contact@2d-amenagement.fr"]},
+        {"id": 2, "name": "Beta sarl", "emails": ["beta@example.com", "compta@beta.example.com"]},
+    ]
+    payments = [
+        {"invoice_id": 11, "amount": "100", "date": "2026-11-01", "customer_name": "2D AMENAGEMENT", "currency": "EUR", "status": "paid"},
+        {"invoice_id": 12, "amount": "200", "date": "2026-08-15", "customer_name": "BETA SARL", "currency": "EUR", "status": "paid"},
+    ]
+    report = compute_encours_report(json.dumps(accounts), json.dumps(customers), json.dumps(payments), today=TODAY)
+    assert report["debtor_count"] == 3
+    assert abs(report["total_due"] - (1200.00 + 285.6 + 50.25)) < 1e-6
+    assert report["payments_count"] == 2 and abs(report["payments_total"] - 300.0) < 1e-6
+    debtors = report["debtors"]
+    assert [d["customer_name"] for d in debtors] == ["Beta sarl", "2D AMENAGEMENT", "CLIENT INCONNU DU CATALOGUE"]
+    assert debtors[0]["customer_email"] == "beta@example.com"
+    assert debtors[1]["customer_email"] == "contact@2d-amenagement.fr"
+    assert debtors[2]["customer_email"] is None and debtors[2]["account_label"] == "CLIENT INCONNU DU CATALOGUE"
+    md = report["report_markdown"]
+    assert "Rapport a blanc des encours clients" in md and "2D AMENAGEMENT" in md and "BETA SARL" not in md
+    assert "411" in md and "J+15" in md
+    try:
+        compute_encours_report('{"not": "a list"}', "[]", "[]", today=TODAY)
+        raise AssertionError("should have raised")
+    except agents.ToolError as e:
+        assert "listes" in str(e)
+    print("compute_encours_report tests: OK")
 
 
 async def test_guardrail() -> None:
@@ -156,5 +191,6 @@ async def main_async() -> None:
 if __name__ == "__main__":
     test_compute_report()
     test_compute_validation()
+    test_compute_encours()
     asyncio.run(main_async())
     print("ALL LOCAL CHECKS PASSED")
