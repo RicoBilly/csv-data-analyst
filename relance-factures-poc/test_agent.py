@@ -85,8 +85,19 @@ async def test_guardrail() -> None:
             turn_id="t", tool_name=tool_name, tool_id=tool_id, tool_call_id="c", arguments=arguments or {}
         )
 
-    assert await guard.pre_tool_call(None, call("get_context", "connector_pennylane_e376.get_context")) is None
-    assert await guard.pre_tool_call(None, call("search_operations", "connector_pennylane_e376.search_operations")) is None
+    for tool_name in (
+        "get_context",
+        "get_company",
+        "search_operations",
+        "list_customers",
+        "get_customer",
+        "list_customer_invoices",
+        "get_customer_invoice",
+        "list_customer_payments",
+        "list_transactions",
+        "list_quotes",  # outil curate list_* non liste explicitement : autorise par prefixe
+    ):
+        assert await guard.pre_tool_call(None, call(tool_name, f"connector_pennylane_e376.{tool_name}")) is None, tool_name
     assert await guard.pre_tool_call(
         None, call("run_operations", "connector_pennylane_e376.run_operations", {"operation_id": "getCustomerInvoices"})
     ) is None
@@ -100,7 +111,7 @@ async def test_guardrail() -> None:
         decision = await guard.pre_tool_call(None, call(name, "connector_pennylane_e376.run_operations", args))
         assert decision is not None and decision.kind == "skip", args
 
-    for tool_name in ("create_invoice", "delete_customer", "unknown_tool"):
+    for tool_name in ("create_invoice", "delete_customer", "send_reminder", "unknown_tool"):
         decision = await guard.pre_tool_call(None, call(tool_name, f"connector_pennylane_e376.{tool_name}"))
         assert decision is not None and decision.kind == "skip", tool_name
 

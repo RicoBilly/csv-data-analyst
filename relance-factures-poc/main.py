@@ -16,17 +16,54 @@ from mistralai import agents
 
 PENNYLANE_PREFIX = "connector_pennylane_e376."
 
-READ_ONLY_TOOLS = {
+# Outils curates officiels du MCP Pennylane (allow-list 100% lecture seule cote serveur) :
+# https://pennylane-mcp.readme.io/docs/getting-started
+CURATED_READ_TOOLS = {
+    # contexte & societes
     "get_context",
     "get_company",
+    "list_companies",
+    "list_firm_file",
+    # clients & creances
+    "list_customers",
     "get_customer",
+    "list_customer_invoices",
+    "get_customer_invoice",
+    "list_customer_payments",
+    # fournisseurs & dettes
+    "list_suppliers",
+    "get_supplier",
+    "list_supplier_invoices",
+    "get_supplier_invoice",
+    "list_supplier_payments",
+    "get_supplier_payment",
+    # comptabilite & transactions bancaires
     "list_accounts",
-    "get_changelog",
+    "get_ledger_account",
+    "get_journal",
+    "list_ledger_entry_lines",
+    "get_entry",
+    "list_transactions",
+    "get_transaction",
     "query_trial_balance",
+    # produits
+    "list_products",
+    "get_product",
+    # reporting & fiscalite
+    "get_financial_report",
     "get_vat_returns",
+    "get_tax_returns",
+    # audit
+    "get_changelog",
+    # meta-outils du catalogue prive (run_operations reste soumis au blocage anti-ecriture)
     "search_operations",
     "run_operations",
 }
+
+# Tout outil curate Pennylane nomme list_*, get_* ou query_* est en lecture seule par
+# construction (allow-list serveur) : on l'autorise meme s'il n'est pas dans la liste
+# ci-dessus, pour rester robuste si Pennylane ajoute des outils curates.
+READ_PREFIXES = ("list_", "get_", "query_")
 
 WRITE_OP_HINTS = (
     "send", "post", "create", "update", "delete", "mark", "finalize",
@@ -205,11 +242,13 @@ def compute_relance_report(invoices_json: str, today: str | None = None) -> dict
 
 
 class ReadOnlyPennylaneGuardrail(agents.Hook):
-    """N'autorise que les outils Pennylane en lecture seule et les outils client.*.
+    """N'autorise que les outils Pennylane curates en lecture seule et les outils client.*.
 
-    Bloque run_operations pour toute operation_id ressemblant a une ecriture, tout outil
-    Pennylane hors liste, run_typescript et tout autre outil : le POC est 100% lecture
-    seule, aucun envoi ni aucune modification n'est possible.
+    Autorise tout outil Pennylane nomme list_*, get_* ou query_* (allow-list lecture seule
+    cote serveur) plus search_operations ; run_operations n'est autorise que si son
+    operation_id ne ressemble pas a une ecriture. Bloque tout le reste (run_typescript,
+    autres connecteurs, outils inconnus) : le POC est 100% lecture seule, aucun envoi ni
+    aucune modification n'est possible.
     """
 
     async def pre_tool_call(self, ctx, call):
@@ -217,7 +256,7 @@ class ReadOnlyPennylaneGuardrail(agents.Hook):
             return None
         if call.tool_id.startswith(PENNYLANE_PREFIX):
             name = call.tool_name
-            if name in READ_ONLY_TOOLS:
+            if name in CURATED_READ_TOOLS or name.startswith(READ_PREFIXES):
                 if name == "run_operations":
                     args = call.arguments or {}
                     op = str(args.get("operation_id", ""))
@@ -229,7 +268,9 @@ class ReadOnlyPennylaneGuardrail(agents.Hook):
                 return None
             return agents.skip(
                 f"L'outil Pennylane '{name}' n'est pas autorise dans ce POC (lecture seule). "
-                f"Outils autorises : {', '.join(sorted(READ_ONLY_TOOLS))}."
+                "Utilise les outils curates en lecture seule (list_*, get_*, query_*, "
+                "search_operations) : list_customer_invoices, get_customer_invoice, "
+                "list_customer_payments, list_customers, get_customer, get_company..."
             )
         return agents.skip(
             f"L'outil '{call.tool_name}' n'est pas autorise : cet agent POC n'utilise que le "
@@ -244,12 +285,15 @@ OBJECTIF DE CE POC (100% LECTURE SEULE) : produire un RAPPORT A BLANC du plan de
 des factures clients en retard dans Pennylane. Tu n'envoies rien, tu ne crees rien, tu ne
 modifies rien : le garde-fou bloque toute ecriture.
 
-CONNECTEUR PENNYLANE (pennylane_e376) - lecture seule :
-- Outils autorises : get_context, get_company, get_customer, list_accounts, get_changelog,
-  query_trial_balance, get_vat_returns, search_operations, run_operations.
-- run_operations n'est autorise que pour des operations en LECTURE (GET) decouvertes via
-  search_operations avec verb="GET" : ne l'utilise jamais pour envoyer, creer, modifier
-  ou supprimer quoi que ce soit (le garde-fou bloque les operations d'ecriture).
+CONNECTEUR PENNYLANE (pennylane_e376) - LECTURE SEULE :
+- Tous les outils curates nommes list_*, get_* ou query_* sont autorises (allow-list
+  100% lecture seule cote serveur Pennylane) : notamment list_customer_invoices,
+  get_customer_invoice, list_customer_payments, list_customers, get_customer,
+  get_company, get_context, list_transactions, query_trial_balance.
+- search_operations / run_operations : DERNIER RECOURS uniquement (search_operations
+  renvoie souvent une erreur 500). run_operations n'est autorise que pour des operations
+  en LECTURE (GET) : ne l'utilise JAMAIS pour envoyer, creer, modifier ou supprimer quoi
+  que ce soit (le garde-fou bloque toute operation d'ecriture).
 
 PROTOCOLE :
 1. company_id : si le message de l'utilisateur contient explicitement un company_id
@@ -258,19 +302,23 @@ PROTOCOLE :
    500 : dans ce cas demande le company_id a l'utilisateur et arrete-toi). NE PAS
    appeler search_operations sans company_id (erreur 500). NE PAS deviner de company_id.
    Ensuite appelle get_company(company_id=<id>) pour le profil complet si besoin.
-2. Liste les factures clients avec company_id=<id> en utilisant DIRECTEMENT les outils
-   curates du connecteur (ne PAS utiliser search_operations : il renvoie souvent une
-   erreur 500) : list_customer_invoices(company_id=<id>, page=1, ...) en paginant
-   jusqu'au bout (champ pagination / next_cursor). L'API ne filtre pas par statut cote
-   serveur : filtre TOI-MEME, client-side, les factures finalisees non soldees dont la
-   deadline est anterieure a aujourd'hui. Respecte les rate limits (~2 req/s sur
-   customer_invoices) : une requete a la fois, pas de rafale.
-3. Pour chaque facture retenue : recupere les paiements via l'outil curate dedie
-   (ex. list_customer_payments / get_customer_invoice avec l'id de facture) et/ou les
-   matched_transactions pour calculer le reste du ; appelle get_customer(company_id=<id>,
-   customer_id=<id>) pour l'email du client et ses conditions de paiement. Si un outil
-   curate manque, utilise run_operations UNIQUEMENT avec un operation_id de lecture (GET)
-   trouve via search_operations(company_id=<id>, verb="GET") — et abandonne vite si 500.
+2. Liste les factures clients avec company_id=<id> en utilisant DIRECTEMENT l'outil
+   curate list_customer_invoices(company_id=<id>, page=1, per_page=100, ...) en paginant
+   jusqu'au bout (champ pagination). Filtre TOI-MEME, client-side, les resultats : ne
+   retiens que les factures non soldees (payment_status different de "paid" / reste du
+   > 0) dont la deadline (date d'echeance) est anterieure a aujourd'hui. Respecte les
+   rate limits (~2 req/s sur customer_invoices) : une requete a la fois, pas de rafale.
+   N'utilise PAS search_operations pour lister les factures (erreurs 500 frequentelles).
+3. Pour chaque facture retenue : get_customer_invoice(company_id=<id>, invoice_id=<id>)
+   renvoie l'en-tete, les lignes, la TVA, les paiements (payments) et avoirs associes,
+   ainsi que accountants_status et payment_status (collection) ; list_customer_payments
+   (company_id=<id>, ...) liste les paiements et les factures qu'ils soldent. Utilise ces
+   outils pour calculer le reste du exact de chaque facture. Appelle
+   get_customer(company_id=<id>, customer_id=<id>) (ou list_customers(company_id=<id>))
+   pour recuperer l'email du client et ses conditions de paiement. Si un outil curate
+   manque, utilise run_operations UNIQUEMENT avec un operation_id de lecture (GET)
+   trouve via search_operations(company_id=<id>, verb="GET") — et abandonne vite en cas
+   d'erreur 500.
 4. Construis une liste JSON d'objets {invoice_id, number, customer_id, customer_name,
    customer_email, date, deadline, currency, amount, amount_paid, status} et appelle
    compute_relance_report(invoices_json=<la liste JSON>, today=<YYYY-MM-DD du jour>).
