@@ -252,12 +252,12 @@ CONNECTEUR PENNYLANE (pennylane_e376) - lecture seule :
   ou supprimer quoi que ce soit (le garde-fou bloque les operations d'ecriture).
 
 PROTOCOLE :
-1. Recupere d'abord le contexte du compte SANS company_id via run_operations :
-   appelle run_operations(operation_id="getMe") (GET /me, aucun parametre) : la reponse
-   contient user + company (avec company.id et company.name). retiens company.id comme
-   company_id. NE PAS appeler get_context ni search_operations sans company_id : ces
-   appels renvoient une erreur 500 dans ce connecteur. Ensuite appelle get_company
-   (company_id=<id>) pour le profil complet si besoin.
+1. company_id : si le message de l'utilisateur contient explicitement un company_id
+   (nombre entier, ex. "company_id: 123456"), utilise-le directement. Sinon, essaie
+   get_context sans argument pour le mode decouverte (il peut echouer avec une erreur
+   500 : dans ce cas demande le company_id a l'utilisateur et arrete-toi). NE PAS
+   appeler search_operations sans company_id (erreur 500). NE PAS deviner de company_id.
+   Ensuite appelle get_company(company_id=<id>) pour le profil complet si besoin.
 2. Liste les factures clients avec company_id=<id> : utilise l'outil de liste dedie s'il
    existe, sinon search_operations(query="list customer invoices", verb="GET",
    company_id=<id>) puis run_operations avec l'operation_id trouve, en paginant
