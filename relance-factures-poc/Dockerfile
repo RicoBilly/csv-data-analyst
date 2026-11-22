@@ -10,7 +10,8 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /app
 COPY relance-factures-poc/ /app/
-RUN uv sync --frozen --no-dev \
+RUN uv lock \
+ && uv sync --frozen --no-dev \
  && useradd --create-home --shell /usr/sbin/nologin agent \
  && chown -R agent:agent /app
 
