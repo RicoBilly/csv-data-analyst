@@ -304,32 +304,35 @@ PROTOCOLE :
 1. company_id : si le message de l'utilisateur contient explicitement un company_id
    (nombre entier, ex. "company_id: 21994007"), utilise-le directement — NE PAS deviner.
    Appelle get_company(company_id=<id>) pour confirmer le profil (cet outil fonctionne).
-2. FACTURES CLIENTS — contournement connu : pour cette entreprise, les outils curates
-   list_customer_invoices et get_customer_invoice renvoient une erreur 500 des qu'il y
-   a des resultats (bug cote serveur Pennylane ; un filtre ne matchant rien, ex.
-   label="__vide__", repond OK avec total=0). NE RETENTE PAS ces outils plus d'une fois.
-   Chemin nominal : run_operations DIRECT en lecture, avec l'operation_id connu
-   "getCustomerInvoices" (API Pennylane v2, GET, lecture seule) :
-   a. run_operations(operation_id="getCustomerInvoices",
-      path_params={"company_id": <id>}, query_params={"page": 1, "per_page": 100})
-      — si l'erreur dit que l'operation est inconnue ou que company_id n'est pas un
-      path param, reessaie SANS path_params :
-      run_operations(operation_id="getCustomerInvoices", query_params={"limit": 100})
-      (autres variantes si besoin : query_params={"page":1,"per_page":100} seul, ou
-      operation_id="listCustomerInvoices").
-   b. Pagination de la reponse : soit {"items": [...], "has_more": bool,
-      "next_cursor": "..."} -> repete avec query_params={"limit": 100, "cursor":
-      next_cursor} tant que has_more est true ; soit {"customer_invoices": [...],
-      "pagination": {"page": n, "per_page": p, "total": t}} -> incremente page.
-      Respecte les rate limits (~2 req/s sur customer_invoices) : une requete a la fois.
-   c. Champs d'une facture brute : id, number, date, payment_deadline (echeance),
-      currency, amount_with_tax (montant TTC), remaining_amount_with_tax (reste du),
-      paid (bool), status, customer_id. Filtre TOI-MEME, client-side : ne retiens que
-      les factures non soldees (paid != true ET remaining_amount_with_tax > 0) dont
-      payment_deadline est anterieur a aujourd'hui.
-   d. Pour une facture individuelle (lignes, paiements) : run_operations(
-      operation_id="getCustomerInvoice", path_params={"company_id": <id>, "id":
-      <invoice_id>}) — variante sans company_id si besoin.
+2. FACTURES CLIENTS — contournement connu : pour cette entreprise, list_customer_invoices
+   renvoie une erreur 500 sur les requetes NON FILTREES (trop volumineuses cote serveur ;
+   un filtre ne matchant rien, ex. label="__vide__", repond OK avec total=0), et
+   get_customer_invoice renvoie 500 lui aussi. search_operations est en panne (500) et
+   run_operations exige des operation_id internes inconnus ("getCustomerInvoices" et
+   "listCustomerInvoices" -> "Opération inconnue"). Strategie, dans l'ordre :
+   a. D'abord la liste des clients (outil qui fonctionne) : list_customers(
+      company_id=<id>, page=1, per_page=100) en paginant via pagination.total ->
+      collecte TOUS les customer ids (et leurs emails, utiles pour le rapport).
+   b. Teste UN filtre etroit sur les factures : list_customer_invoices(company_id=<id>,
+      page=1, customer_ids=[<id du premier client de la liste>]).
+      - Si reponse 200 avec des lignes : le filtrage par client fonctionne. Liste alors
+        les factures PAR LOT de clients : customer_ids=[...jusqu'a 50 ids...], page=1,
+        en paginant chaque lot (pagination.total / per_page / page). Une requete a la
+        fois (rate limit ~2 req/s sur customer_invoices). Si un lot renvoie 500,
+        decoupe-le en deux lots plus petits et reessaie.
+      - Si 500 aussi : passe a (c).
+   c. run_operations en lecture, UNE operation a la fois, avec path_params=
+      {"company_id": <id>} et query_params={"page": 1, "per_page": 100}, en testant
+      les operation_id candidats dans cet ordre : "list_customer_invoices",
+      "get_customer_invoices", "customer_invoices", "getCompanyCustomerInvoices",
+      "invoices". Si la reponse est "Opération inconnue", essaie le candidat suivant.
+      NE PAS appeler search_operations (500).
+   d. Dans tous les cas, filtre TOI-MEME client-side : ne retiens que les factures non
+      soldees (payment_status different de "paid", ou paid != true, ou
+      remaining_amount_with_tax > 0) dont la deadline (payment_deadline / deadline /
+      due_date) est anterieure a aujourd'hui. Champs usuels d'une facture : id, number,
+      date, payment_deadline, currency, amount_with_tax, remaining_amount_with_tax,
+      paid, status, customer_id.
 3. PAIEMENTS ET CLIENTS — outils curates qui FONCTIONNENT pour cette entreprise :
    - list_customer_payments(company_id=<id>, page=1, ...) en paginant (champ
      pagination) : chaque paiement a id, date, customer_id, customer_name, invoice_id,
