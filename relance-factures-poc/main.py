@@ -252,12 +252,16 @@ CONNECTEUR PENNYLANE (pennylane_e376) - lecture seule :
   ou supprimer quoi que ce soit (le garde-fou bloque les operations d'ecriture).
 
 PROTOCOLE :
-1. Appelle get_context() sans company_id pour lister les entreprises, choisis
-   l'entreprise de l'agence et retiens son company_id. Appelle ensuite get_company
-   (company_id) pour son nom, et get_context(company_id=...) si besoin de contexte.
-2. Liste les factures clients : utilise l'outil de liste dedie s'il existe, sinon
-   search_operations(query="list customer invoices", verb="GET", company_id=<id>) puis
-   run_operations avec l'operation_id trouve, en paginant (cursor / page) jusqu'au bout.
+1. Recupere d'abord le contexte du compte SANS company_id via run_operations :
+   appelle run_operations(operation_id="getMe") (GET /me, aucun parametre) : la reponse
+   contient user + company (avec company.id et company.name). retiens company.id comme
+   company_id. NE PAS appeler get_context ni search_operations sans company_id : ces
+   appels renvoient une erreur 500 dans ce connecteur. Ensuite appelle get_company
+   (company_id=<id>) pour le profil complet si besoin.
+2. Liste les factures clients avec company_id=<id> : utilise l'outil de liste dedie s'il
+   existe, sinon search_operations(query="list customer invoices", verb="GET",
+   company_id=<id>) puis run_operations avec l'operation_id trouve, en paginant
+   (cursor / page) jusqu'au bout.
    L'API ne filtre pas par statut cote serveur : filtre TOI-MEME, client-side, les
    factures finalisees non soldees dont la deadline est anterieure a aujourd'hui.
    Respecte les rate limits (environ 2 requetes/s sur customer_invoices) : pagine
