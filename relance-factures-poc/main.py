@@ -258,19 +258,19 @@ PROTOCOLE :
    500 : dans ce cas demande le company_id a l'utilisateur et arrete-toi). NE PAS
    appeler search_operations sans company_id (erreur 500). NE PAS deviner de company_id.
    Ensuite appelle get_company(company_id=<id>) pour le profil complet si besoin.
-2. Liste les factures clients avec company_id=<id> : utilise l'outil de liste dedie s'il
-   existe, sinon search_operations(query="list customer invoices", verb="GET",
-   company_id=<id>) puis run_operations avec l'operation_id trouve, en paginant
-   (cursor / page) jusqu'au bout.
-   L'API ne filtre pas par statut cote serveur : filtre TOI-MEME, client-side, les
-   factures finalisees non soldees dont la deadline est anterieure a aujourd'hui.
-   Respecte les rate limits (environ 2 requetes/s sur customer_invoices) : pagine
-   proprement, sans rafale.
-3. Pour chaque facture retenue : recupere les paiements (search_operations "payments
-   customer invoice" verb="GET", puis run_operations sur /customer_invoices/{id}/payments)
-   et/ou les matched_transactions pour calculer le reste du ; appelle
-   get_customer(company_id=<id>, customer_id=<id>) pour l'email du client et ses
-   conditions de paiement.
+2. Liste les factures clients avec company_id=<id> en utilisant DIRECTEMENT les outils
+   curates du connecteur (ne PAS utiliser search_operations : il renvoie souvent une
+   erreur 500) : list_customer_invoices(company_id=<id>, page=1, ...) en paginant
+   jusqu'au bout (champ pagination / next_cursor). L'API ne filtre pas par statut cote
+   serveur : filtre TOI-MEME, client-side, les factures finalisees non soldees dont la
+   deadline est anterieure a aujourd'hui. Respecte les rate limits (~2 req/s sur
+   customer_invoices) : une requete a la fois, pas de rafale.
+3. Pour chaque facture retenue : recupere les paiements via l'outil curate dedie
+   (ex. list_customer_payments / get_customer_invoice avec l'id de facture) et/ou les
+   matched_transactions pour calculer le reste du ; appelle get_customer(company_id=<id>,
+   customer_id=<id>) pour l'email du client et ses conditions de paiement. Si un outil
+   curate manque, utilise run_operations UNIQUEMENT avec un operation_id de lecture (GET)
+   trouve via search_operations(company_id=<id>, verb="GET") — et abandonne vite si 500.
 4. Construis une liste JSON d'objets {invoice_id, number, customer_id, customer_name,
    customer_email, date, deadline, currency, amount, amount_paid, status} et appelle
    compute_relance_report(invoices_json=<la liste JSON>, today=<YYYY-MM-DD du jour>).
