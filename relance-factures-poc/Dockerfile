@@ -11,11 +11,6 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 COPY relance-factures-poc/ /app/
 
-# Secret injecte au runtime par le deploiement (secret workspace cle_api_pennylane ->
-# env PENNYLANE_API_TOKEN). Jamais de valeur en dur ici.
-ARG PENNYLANE_API_TOKEN=""
-ENV PENNYLANE_API_TOKEN=${PENNYLANE_API_TOKEN}
-
 RUN uv lock \
  && uv sync --frozen --no-dev \
  && useradd --create-home --shell /usr/sbin/nologin agent \
