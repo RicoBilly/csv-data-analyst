@@ -25,7 +25,10 @@ from mistralai import agents
 
 PENNYLANE_PREFIX = "connector_pennylane_e376."
 PENNYLANE_API_BASE = "https://app.pennylane.com/api/external/v2"
+# Nom principal attendu ; repli sur le nom du secret si le binding console a repris
+# le nom du secret comme nom de variable d'env.
 API_TOKEN_ENV = "PENNYLANE_API_TOKEN"
+API_TOKEN_ENV_FALLBACK = "cle_api_pennylane"
 
 # Outils curates officiels du MCP Pennylane (allow-list 100% lecture seule cote serveur) :
 # https://pennylane-mcp.readme.io/docs/getting-started
@@ -355,11 +358,14 @@ def compute_encours_report(accounts_json: str, customers_json: str, payments_jso
 
 def _api_v2_get(path: str, params: dict[str, Any], company_id: int) -> dict[str, Any]:
     """GET sur l'API Company v2 Pennylane. Le token vient UNIQUEMENT de l'env."""
-    token = os.environ.get(API_TOKEN_ENV, "").strip()
+    token = next(
+        (os.environ[v].strip() for v in (API_TOKEN_ENV, API_TOKEN_ENV_FALLBACK) if os.environ.get(v, "").strip()),
+        "",
+    )
     if not token:
         raise agents.ToolError(
-            f"Variable d'environnement {API_TOKEN_ENV} absente : le secret workspace "
-            "(cle_api_pennylane) n'est pas injecte dans ce deploiement."
+            f"Variable d'environnement {API_TOKEN_ENV} (ou {API_TOKEN_ENV_FALLBACK}) absente : "
+            "le secret workspace (cle_api_pennylane) n'est pas injecte dans ce deploiement."
         )
     query = urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")})
     url = f"{PENNYLANE_API_BASE}{path}" + (f"?{query}" if query else "")
@@ -424,9 +430,10 @@ def fetch_pennylane_customer_invoices(company_id: int, max_pages: int = 40) -> d
         21994007), transmis en header X-Company-Id.
     max_pages : nombre max de pages de 100 factures (securite, defaut 40 = 4000 factures).
 
-    Le token API est lu automatiquement depuis la variable d'environnement
-    PENNYLANE_API_TOKEN (secret workspace injecte au deploiement) : ne JAMAIS le passer
-    en argument et ne jamais l'afficher. Appels effectues (GET, aucune ecriture) :
+    Le token API est lu automatiquement depuis l'environnement du worker
+    (PENNYLANE_API_TOKEN, ou cle_api_pennylane selon le binding ; secret workspace injecte
+    au deploiement) : ne JAMAIS le passer en argument et ne jamais l'afficher.
+    Appels effectues (GET, aucune ecriture) :
     GET /api/external/v2/customer_invoices?limit=100&filter=[draft=false, credit_note=false]
     pagine par cursor, puis GET /api/external/v2/customers pagine pour les noms/emails.
 
