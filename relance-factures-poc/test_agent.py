@@ -7,7 +7,7 @@ import os
 from mistralai import agents
 
 import main
-from main import ReadOnlyPennylaneGuardrail, compute_encours_report, compute_relance_report, fetch_pennylane_customer_invoices, top_debtors_report
+from main import ReadOnlyPennylaneGuardrail, compute_encours_report, compute_relance_report, fetch_pennylane_customer_invoices, fetch_top_debtors, top_debtors_report
 
 TODAY = "2026-11-22"
 
@@ -216,6 +216,72 @@ def test_top_debtors() -> None:
     print("top_debtors_report tests: OK")
 
 
+def test_fetch_top_debtors() -> None:
+    os.environ[main.API_TOKEN_ENV] = "dummy-token-never-printed"
+    inv_page1 = {"items": [
+        {"id": 1, "invoice_number": "F1", "date": "2026-10-01", "deadline": "2026-11-01", "currency": "EUR",
+         "currency_amount": "1000.00", "remaining_amount_with_tax": "1000.00", "paid": False, "status": "late", "customer": {"id": 7}},
+        {"id": 2, "invoice_number": "F2", "date": "2026-10-01", "deadline": "2026-11-10", "currency": "EUR",
+         "currency_amount": "500.00", "remaining_amount_with_tax": "100.00", "paid": False, "status": "late", "customer": {"id": 7}},
+        {"id": 3, "invoice_number": "F3", "date": "2026-09-01", "deadline": "2026-10-01", "currency": "EUR",
+         "currency_amount": "300.00", "remaining_amount_with_tax": "300.00", "paid": False, "status": "late", "customer": {"id": 8}},
+        {"id": 4, "invoice_number": "F4", "date": "2026-11-01", "deadline": "2026-12-01", "currency": "EUR",
+         "currency_amount": "999.00", "remaining_amount_with_tax": "999.00", "paid": False, "status": "upcoming", "customer": {"id": 8}},
+        {"id": 5, "invoice_number": "F5", "date": "2026-09-01", "deadline": "2026-09-15", "currency": "EUR",
+         "currency_amount": "50.00", "paid": True, "status": "paid", "customer": {"id": 8}},
+    ], "has_more": True, "next_cursor": "c2"}
+    inv_page2 = {"items": [], "has_more": False}
+
+    def make_fake(with_accounts=True):
+        def fake_get(path, params, company_id):
+            assert company_id == 21994007
+            if path == "/customers":
+                return {"items": [
+                    {"id": 7, "name": "ACME", "emails": ["a@acme.fr"]},
+                    {"id": 8, "name": "BETA", "email": "b@beta.fr"},
+                ], "has_more": False}
+            if path == "/ledger_accounts":
+                if not with_accounts:
+                    raise agents.ToolError("API Pennylane v2 /ledger_accounts -> HTTP 403: scope missing")
+                return {"items": [
+                    {"number": "411000001", "label": "ACME", "total_balance": "1400.00"},
+                    {"number": "411000002", "label": "Beta", "total_balance": "250.00"},
+                    {"number": "512000001", "label": "Banque", "total_balance": "99999.0"},
+                ], "has_more": False}
+            if path == "/customer_invoices":
+                return inv_page1 if params.get("cursor") is None else inv_page2
+            raise AssertionError(f"unexpected path {path}")
+        return fake_get
+
+    try:
+        orig_get = main._api_v2_get
+        main._api_v2_get = make_fake(with_accounts=True)
+        try:
+            out = fetch_top_debtors(21994007, today="2026-11-23", top_n=20)
+        finally:
+            main._api_v2_get = orig_get
+        assert out["source"] == "pennylane_api_v2" and out["accounts_411"] is True
+        assert out["invoices_seen"] == 5 and out["pages_fetched"] == 2
+        assert out["debtor_count"] == 2 and abs(out["total_due"] - 1400.0) < 1e-6
+        top = out["top"]
+        assert top[0]["customer_name"] == "ACME" and top[0]["invoices_overdue"] == 2 and top[0]["total_due"] == 1100.0
+        assert top[0]["balance_411"] == 1400.0 and top[0]["gap_411_minus_invoices"] == 300.0
+        assert top[1]["customer_name"] == "BETA" and top[1]["total_due"] == 300.0 and top[1]["balance_411"] == 250.0
+        md = out["report_markdown"]
+        assert "Top 2" in md and "ACME" in md and "BETA" in md and "Banque" not in md and "F4" not in md
+
+        main._api_v2_get = make_fake(with_accounts=False)
+        try:
+            out2 = fetch_top_debtors(21994007, today="2026-11-23", top_n=1)
+        finally:
+            main._api_v2_get = orig_get
+        assert out2["accounts_411"] is False and len(out2["top"]) == 1 and out2["top"][0]["balance_411"] is None
+        assert "ledger_accounts" in out2["report_markdown"]
+    finally:
+        del os.environ[main.API_TOKEN_ENV]
+    print("fetch_top_debtors tests: OK")
+
+
 async def test_guardrail() -> None:
     guard = ReadOnlyPennylaneGuardrail()
 
@@ -243,6 +309,7 @@ async def test_guardrail() -> None:
     assert await guard.pre_tool_call(None, call("compute_relance_report", "client.compute_relance_report")) is None
     assert await guard.pre_tool_call(None, call("fetch_pennylane_customer_invoices", "client.fetch_pennylane_customer_invoices", {"company_id": 21994007})) is None
     assert await guard.pre_tool_call(None, call("top_debtors_report", "client.top_debtors_report", {"invoices_json": "[]"})) is None
+    assert await guard.pre_tool_call(None, call("fetch_top_debtors", "client.fetch_top_debtors", {"company_id": 21994007, "top_n": 20})) is None
 
     for name, args in [
         ("run_operations", {"operation_id": "sendByEmailCustomerInvoice"}),
@@ -300,5 +367,6 @@ if __name__ == "__main__":
     test_compute_encours()
     test_fetch_api_v2_tool()
     test_top_debtors()
+    test_fetch_top_debtors()
     asyncio.run(main_async())
     print("ALL LOCAL CHECKS PASSED")

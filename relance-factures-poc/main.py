@@ -606,6 +606,174 @@ def top_debtors_report(invoices_json: str, accounts_json: str = "[]", today: str
     }
 
 
+def _norm_name(s: Any) -> str:
+    return " ".join(str(s or "").upper().split())
+
+
+@agents.tool
+def fetch_top_debtors(company_id: int, today: str | None = None, top_n: int = 20, max_pages: int = 40) -> dict[str, Any]:
+    """Top N des clients debiteurs, calcule ENTIEREMENT cote serveur en un seul appel outil.
+
+    company_id : identifiant Pennylane (ex. 21994007). today : date du jour YYYY-MM-DD
+        (vide = date courante). top_n : taille du top (defaut 20). max_pages : securite
+        pagination factures (defaut 40 pages de 100).
+
+    Appels API v2 effectues en GET uniquement (token lu dans l'environnement du worker,
+    jamais passe en argument ni affiche) :
+    - GET /customers (noms/emails) ;
+    - GET /ledger_accounts, filtre local number commencant par "411" (si le scope
+      ledger_accounts:readonly est absent -> 403, la colonne solde 411 est alors non
+      renseignee et accounts_411=false) ;
+    - GET /customer_invoices?filter=[draft=false, credit_note=false], pagine par cursor,
+      agrege A LA VOLEE par client (aucune grosse donnee ne transite par l'agent) :
+      nb de factures en retard (echeance <= today, reste du > 0) et total du reste du,
+      croises avec le solde du/des compte(s) 411 dont le label = nom du client.
+
+    Retourne un dict : debtor_count, total_due, accounts_411, source="pennylane_api_v2",
+    top (liste triee par reste du decroissant) et report_markdown (tableau markdown).
+    """
+    if not isinstance(company_id, int) or company_id <= 0:
+        raise agents.ToolError("company_id doit etre un entier positif (ex. 21994007).")
+    if today:
+        run_date = _parse_date(today)
+        if run_date is None:
+            raise agents.ToolError("today doit etre au format YYYY-MM-DD.")
+    else:
+        run_date = agents.now().date()
+    if not isinstance(top_n, int) or top_n <= 0:
+        raise agents.ToolError("top_n doit etre un entier positif.")
+
+    cust_by_id: dict[int, dict[str, Any]] = {}
+    try:
+        cursor = None
+        for _ in range(20):
+            data = _api_v2_get("/customers", {"limit": 100, "cursor": cursor}, company_id)
+            for c in data.get("items", []):
+                if c.get("id") is not None:
+                    cust_by_id[c["id"]] = c
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+            time.sleep(0.3)
+    except agents.ToolError:
+        cust_by_id = {}
+
+    acc_by_name: dict[str, dict[str, Any]] = {}
+    accounts_411 = False
+    try:
+        cursor = None
+        for _ in range(30):
+            data = _api_v2_get("/ledger_accounts", {"limit": 100, "cursor": cursor}, company_id)
+            for a in data.get("items", []):
+                if not str(a.get("number") or "").startswith("411"):
+                    continue
+                key = _norm_name(a.get("label"))
+                if not key:
+                    continue
+                cur = acc_by_name.setdefault(key, {"balance": 0.0, "numbers": []})
+                cur["balance"] += _to_float(a.get("total_balance"))
+                cur["numbers"].append(a.get("number"))
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+            time.sleep(0.3)
+        accounts_411 = True
+    except agents.ToolError:
+        accounts_411 = False
+
+    debtors: dict[str, dict[str, Any]] = {}
+    invoices_seen = 0
+    pages = 0
+    cursor = None
+    flt = json.dumps([
+        {"field": "draft", "operator": "eq", "value": "false"},
+        {"field": "credit_note", "operator": "eq", "value": "false"},
+    ])
+    while pages < max_pages:
+        data = _api_v2_get("/customer_invoices", {"limit": 100, "cursor": cursor, "filter": flt, "sort": "-id"}, company_id)
+        pages += 1
+        for item in data.get("items", []):
+            invoices_seen += 1
+            mapped = _map_v2_invoice(item, cust_by_id)
+            if mapped is None:
+                continue
+            deadline = _parse_date(mapped.get("deadline"))
+            if deadline is None or deadline > run_date:
+                continue
+            amount_due = round(_to_float(mapped.get("amount")) - _to_float(mapped.get("amount_paid")), 2)
+            if amount_due <= 0.005:
+                continue
+            name = str(mapped.get("customer_name") or "client inconnu")
+            key = _norm_name(name)
+            cur = debtors.setdefault(key, {
+                "customer_name": name,
+                "customer_email": mapped.get("customer_email"),
+                "invoices_overdue": 0,
+                "total_due": 0.0,
+                "currency": mapped.get("currency") or "EUR",
+                "non_eur": False,
+            })
+            if (mapped.get("currency") or "EUR") != cur["currency"]:
+                cur["non_eur"] = True
+            cur["invoices_overdue"] += 1
+            cur["total_due"] = round(cur["total_due"] + amount_due, 2)
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+        time.sleep(0.3)
+
+    rows = []
+    for key, d in debtors.items():
+        acc = acc_by_name.get(key)
+        rows.append({
+            "customer_name": d["customer_name"],
+            "customer_email": d["customer_email"],
+            "invoices_overdue": d["invoices_overdue"],
+            "total_due": d["total_due"],
+            "currency": "EUR" if not d["non_eur"] else d["currency"] + " (mixte)",
+            "balance_411": round(acc["balance"], 2) if acc else None,
+            "accounts_411": acc["numbers"] if acc else [],
+            "gap_411_minus_invoices": round(acc["balance"] - d["total_due"], 2) if acc else None,
+        })
+    rows.sort(key=lambda r: -r["total_due"])
+    top = rows[:top_n]
+    total_due = round(sum(r["total_due"] for r in rows), 2)
+
+    lines = [
+        f"# Top {len(top)} des clients debiteurs - {run_date.isoformat()} (API v2, {invoices_seen} factures lues, {pages} pages)",
+        "",
+        "POC lecture seule : aucun envoi effectue, aucune donnee modifiee.",
+        "",
+        f"- Clients debiteurs (au moins une facture echue non soldee) : **{len(rows)}**",
+        f"- Reste du total sur factures echues : **{total_due:.2f} EUR**",
+        f"- Comptes 411 lus via API v2 : {'oui' if accounts_411 else 'non (scope ledger_accounts:readonly absent -> colonne 411 non renseignee)'}",
+        "",
+        "| Rang | Client | Email | Factures en retard | Reste du (EUR) | Solde compte 411 | Ecart (411 - factures) |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for i, r in enumerate(top, 1):
+        bal = f"{r['balance_411']:.2f}" if r["balance_411"] is not None else "—"
+        gap = f"{r['gap_411_minus_invoices']:.2f}" if r["gap_411_minus_invoices"] is not None else "—"
+        lines.append(f"| {i} | {r['customer_name']} | {r['customer_email'] or ''} | {r['invoices_overdue']} | {r['total_due']:.2f} | {bal} | {gap} |")
+    lines += [
+        "",
+        "Lecture : 'Reste du' = somme des factures echues non soldees (API v2, meme base que l'app",
+        "Pennylane) ; 'Solde compte 411' = solde comptable du compte client (peut contenir des",
+        "ecritures hors factures) ; l'ecart explique les differences entre l'app et la comptabilite.",
+    ]
+    return {
+        "today": run_date.isoformat(),
+        "source": "pennylane_api_v2",
+        "invoices_seen": invoices_seen,
+        "pages_fetched": pages,
+        "accounts_411": accounts_411,
+        "debtor_count": len(rows),
+        "total_due": total_due,
+        "top": top,
+        "report_markdown": "\n".join(lines),
+    }
+
+
 class ReadOnlyPennylaneGuardrail(agents.Hook):
     """N'autorise que les outils Pennylane curates en lecture seule et les outils client.*.
 
@@ -666,11 +834,13 @@ PROTOCOLE :
    l'etape 2>, today=<YYYY-MM-DD du jour>). Ne calcule rien toi-meme.
 4. Ta reponse finale est UNIQUEMENT le report_markdown retourne par
    compute_relance_report, suivi de la phrase "Aucun envoi effectue (POC lecture seule)."
-5. Si l'utilisateur demande un TOP N des debiteurs : pagine en plus
-   list_accounts(company_id=<id>, number_prefix="411", page=1..N) via le MCP, puis appelle
-   top_debtors_report(invoices_json=<invoices_json de l'etape 2>,
-   accounts_json=<liste JSON de tous les comptes 411>, today=<YYYY-MM-DD>, top_n=N) et
-   reponds avec son report_markdown (croisement vue facture API v2 x solde compte 411).
+5. Si l'utilisateur demande un TOP N des debiteurs : appelle UNIQUEMENT
+   fetch_top_debtors(company_id=<id>, today=<YYYY-MM-DD>, top_n=N). Tout est calcule cote
+   serveur dans l'outil (factures + clients + comptes 411 via API v2) : ne passe AUCUN gros
+   JSON entre outils et ne pagine pas list_accounts toi-meme. Reponds avec son
+   report_markdown + 'Aucun envoi effectue (POC lecture seule).'
+6. Variante si fetch_top_debtors est indisponible : top_debtors_report(invoices_json=...,
+   accounts_json=<comptes 411 MCP>, today=..., top_n=N).
 
 FALLBACK (uniquement si l'etape 2 echoue, ex. 401/403/429 ou reseau) :
 a. list_accounts(company_id=<id>, number_prefix="411", page=1..N) en paginant
@@ -705,7 +875,7 @@ agent = agents.Agent(
     name="relance-factures-poc",
     description="POC lecture seule : lit les factures clients impayees dans Pennylane (connexion de l'utilisateur) et produit un rapport a blanc du plan de relance J+15/30/45/60/90. Aucun envoi.",
     instructions=INSTRUCTIONS,
-    tools=[compute_relance_report, compute_encours_report, fetch_pennylane_customer_invoices, top_debtors_report],
+    tools=[compute_relance_report, compute_encours_report, fetch_pennylane_customer_invoices, top_debtors_report, fetch_top_debtors],
     connectors=[agents.connector("pennylane_e376")],
     builtins=agents.Builtins(skills=False, subagents=False),
     guardrails=[ReadOnlyPennylaneGuardrail()],
