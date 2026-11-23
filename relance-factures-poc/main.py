@@ -7,7 +7,8 @@ L'agent lit les factures clients (dates d'emission, echeances, paiements, client
   renvoie des 500 sur les endpoints factures ;
 - via le connecteur MCP Pennylane en secours (comptes 411, clients, paiements).
 Il applique les regles de relance (J = date d'echeance ; seuils J+15 / J+30 / J+45 /
-J+60 / J+90 ; exclusion de la 1re relance quand date d'emission = date d'echeance) de
+J+60 / J+90 ; exclusion de la 1re relance quand date d'emission = date d'echeance ;
+exclusion des factures en paiement partiel, encaissees par prelevement automatique) de
 facon deterministe via l'outil compute_relance_report, et produit un rapport markdown.
 Aucun envoi, aucune ecriture : le garde-fou bloque tout outil non autorise.
 """
@@ -139,7 +140,9 @@ def compute_relance_report(invoices_json: str, today: str | None = None) -> dict
 
     Regles : J = date d'echeance. Seuils J+15, J+30, J+45, J+60, J+90. Une facture dont la
     date d'emission est identique a sa date d'echeance n'est PAS sujette a la 1re relance.
-    Les factures soldees ou non encore echues sont exclues.
+    Les factures soldees ou non encore echues sont exclues. Une facture ayant recu un
+    PAIEMENT PARTIEL (amount_paid > 0 et reste du > 0) n'est JAMAIS relancee : le solde
+    est encaisse par prelevement automatique (bucket excluded_partial_payment).
 
     Retourne un dict avec le resume, la liste des factures par etape et un rapport
     markdown (champ report_markdown).
@@ -158,6 +161,7 @@ def compute_relance_report(invoices_json: str, today: str | None = None) -> dict
     paid: list[dict[str, Any]] = []
     not_due: list[dict[str, Any]] = []
     excluded_first: list[dict[str, Any]] = []
+    partial: list[dict[str, Any]] = []
 
     for inv in invoices:
         issue = _parse_date(_pick(inv, "date", "issue_date"))
@@ -177,10 +181,15 @@ def compute_relance_report(invoices_json: str, today: str | None = None) -> dict
             "deadline": deadline.isoformat(),
             "currency": _pick(inv, "currency") or "EUR",
             "amount_due": amount_due,
+            "amount_paid": amount_paid,
             "status": _pick(inv, "status"),
         }
         if amount_due <= 0.005:
             paid.append(entry)
+            continue
+        if amount_paid > 0.005:
+            entry["note"] = "paiement partiel recu -> prelevement automatique, hors relances"
+            partial.append(entry)
             continue
         days_late = (run_date - deadline).days
         entry["days_late"] = days_late
@@ -208,6 +217,7 @@ def compute_relance_report(invoices_json: str, today: str | None = None) -> dict
         by_stage.setdefault(str(e["stage"]["level"]), []).append(e)
 
     total_due = round(sum(e["amount_due"] for e in items), 2)
+    partial_due = round(sum(e["amount_due"] for e in partial), 2)
     currency = items[0]["currency"] if items else "EUR"
 
     lines = [
@@ -219,6 +229,7 @@ def compute_relance_report(invoices_json: str, today: str | None = None) -> dict
         f"- Factures soldees ignorees : {len(paid)}",
         f"- Factures non echues / hors fenetre de relance : {len(not_due)}",
         f"- Factures exclues de la 1re relance (emission = echeance) : {len(excluded_first)}",
+        f"- Factures en paiement partiel, HORS relances (prelevement automatique) : {len(partial)} (reste du {partial_due:.2f} EUR)",
         "",
     ]
     if items:
@@ -239,6 +250,14 @@ def compute_relance_report(invoices_json: str, today: str | None = None) -> dict
         for e in excluded_first:
             lines.append(f"- {e['number'] or e['invoice_id']} ({e['customer_name']}) - echeance {e['deadline']} - {e['days_late']} j de retard")
         lines.append("")
+    if partial:
+        lines += ["## Hors relances : paiement partiel recu (prelevement automatique)", ""]
+        for e in partial:
+            lines.append(
+                f"- {e['number'] or e['invoice_id']} ({e['customer_name']}) - echeance {e['deadline']} - "
+                f"reste du {e['amount_due']:.2f} {e['currency']} - deja paye {e['amount_paid']:.2f} {e['currency']}"
+            )
+        lines.append("")
 
     report_markdown = "\n".join(lines)
     return {
@@ -250,6 +269,9 @@ def compute_relance_report(invoices_json: str, today: str | None = None) -> dict
         "paid_ignored": len(paid),
         "not_due": len(not_due),
         "excluded_first_relance": [e["invoice_id"] for e in excluded_first],
+        "excluded_partial_payment": [e["invoice_id"] for e in partial],
+        "partial_payment_count": len(partial),
+        "partial_payment_due": partial_due,
         "items": items,
         "report_markdown": report_markdown,
     }
@@ -505,6 +527,9 @@ def top_debtors_report(invoices_json: str, accounts_json: str = "[]", today: str
 
     Pour chaque client : nombre de factures en retard (echeance <= today et reste du > 0)
     et total du reste du, croises avec le solde du/des compte(s) 411 correspondant(s).
+    Les factures en paiement partiel (amount_paid > 0) sont signalees a part
+    (partial_invoices / partial_due) : elles restent dans l'encours mais sont HORS
+    relances (prelevement automatique).
     Retourne un dict avec debtor_count, total_due, top (liste triee) et report_markdown
     (tableau : rang, client, email, factures en retard, reste du, solde 411, ecart).
     """
@@ -551,6 +576,8 @@ def top_debtors_report(invoices_json: str, accounts_json: str = "[]", today: str
             "customer_email": _pick(inv, "customer_email", "email"),
             "invoices_overdue": 0,
             "total_due": 0.0,
+            "partial_invoices": 0,
+            "partial_due": 0.0,
             "currency": cur,
             "non_eur": False,
         })
@@ -558,6 +585,9 @@ def top_debtors_report(invoices_json: str, accounts_json: str = "[]", today: str
             d["non_eur"] = True
         d["invoices_overdue"] += 1
         d["total_due"] = round(d["total_due"] + amount_due, 2)
+        if amount_paid > 0.005:
+            d["partial_invoices"] += 1
+            d["partial_due"] = round(d["partial_due"] + amount_due, 2)
 
     rows = []
     for key, d in debtors.items():
@@ -567,6 +597,8 @@ def top_debtors_report(invoices_json: str, accounts_json: str = "[]", today: str
             "customer_email": d["customer_email"],
             "invoices_overdue": d["invoices_overdue"],
             "total_due": d["total_due"],
+            "partial_invoices": d["partial_invoices"],
+            "partial_due": d["partial_due"],
             "currency": "EUR" if not d["non_eur"] else d["currency"] + " (mixte)",
             "balance_411": round(acc["balance"], 2) if acc else None,
             "accounts_411": acc["numbers"] if acc else [],
@@ -575,6 +607,8 @@ def top_debtors_report(invoices_json: str, accounts_json: str = "[]", today: str
     rows.sort(key=lambda r: -r["total_due"])
     top = rows[:top_n]
     total_due = round(sum(r["total_due"] for r in rows), 2)
+    partial_inv = sum(r["partial_invoices"] for r in rows)
+    partial_due = round(sum(r["partial_due"] for r in rows), 2)
 
     lines = [
         f"# Top {len(top)} des clients debiteurs - {run_date.isoformat()} (vue facture API v2 croisee compte 411)",
@@ -583,6 +617,7 @@ def top_debtors_report(invoices_json: str, accounts_json: str = "[]", today: str
         "",
         f"- Clients debiteurs (au moins une facture echue non soldee) : **{len(rows)}**",
         f"- Reste du total sur factures echues : **{total_due:.2f} EUR**",
+        f"- Dont paiement partiel (prelevement automatique, HORS relances) : {partial_inv} factures, {partial_due:.2f} EUR",
         "",
         "| Rang | Client | Email | Factures en retard | Reste du (EUR) | Solde compte 411 | Ecart (411 - factures) |",
         "|---|---|---|---|---|---|---|",
@@ -601,6 +636,7 @@ def top_debtors_report(invoices_json: str, accounts_json: str = "[]", today: str
         "today": run_date.isoformat(),
         "debtor_count": len(rows),
         "total_due": total_due,
+        "partial_payment_excluded_from_relance": {"invoices": partial_inv, "due": partial_due},
         "top": top,
         "report_markdown": "\n".join(lines),
     }
@@ -634,6 +670,9 @@ def fetch_top_debtors(company_id: int, today: str | None = None, top_n: int = 20
 
     Retourne un dict : debtor_count, total_due, accounts_411, source="pennylane_api_v2",
     top (liste triee par reste du decroissant) et report_markdown (tableau markdown).
+    Les factures en paiement partiel (amount_paid > 0) sont comptabilisees a part dans
+    partial_payment_excluded_from_relance : elles restent dans l'encours mais sont HORS
+    relances (prelevement automatique).
     """
     if not isinstance(company_id, int) or company_id <= 0:
         raise agents.ToolError("company_id doit etre un entier positif (ex. 21994007).")
@@ -720,6 +759,8 @@ def fetch_top_debtors(company_id: int, today: str | None = None, top_n: int = 20
                 "customer_email": mapped.get("customer_email"),
                 "invoices_overdue": 0,
                 "total_due": 0.0,
+                "partial_invoices": 0,
+                "partial_due": 0.0,
                 "currency": mapped.get("currency") or "EUR",
                 "non_eur": False,
             })
@@ -727,6 +768,9 @@ def fetch_top_debtors(company_id: int, today: str | None = None, top_n: int = 20
                 cur["non_eur"] = True
             cur["invoices_overdue"] += 1
             cur["total_due"] = round(cur["total_due"] + amount_due, 2)
+            if _to_float(mapped.get("amount_paid")) > 0.005:
+                cur["partial_invoices"] += 1
+                cur["partial_due"] = round(cur["partial_due"] + amount_due, 2)
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
@@ -740,6 +784,8 @@ def fetch_top_debtors(company_id: int, today: str | None = None, top_n: int = 20
             "customer_email": d["customer_email"],
             "invoices_overdue": d["invoices_overdue"],
             "total_due": d["total_due"],
+            "partial_invoices": d["partial_invoices"],
+            "partial_due": d["partial_due"],
             "currency": "EUR" if not d["non_eur"] else d["currency"] + " (mixte)",
             "balance_411": None,
             "accounts_411": acc["numbers"] if acc else [],
@@ -748,6 +794,8 @@ def fetch_top_debtors(company_id: int, today: str | None = None, top_n: int = 20
     rows.sort(key=lambda r: -r["total_due"])
     top = rows[:top_n]
     total_due = round(sum(r["total_due"] for r in rows), 2)
+    partial_inv = sum(r["partial_invoices"] for r in rows)
+    partial_due = round(sum(r["partial_due"] for r in rows), 2)
 
     lines = [
         f"# Top {len(top)} des clients debiteurs - {run_date.isoformat()} (API v2, {invoices_seen} factures lues, {pages} pages)",
@@ -756,6 +804,7 @@ def fetch_top_debtors(company_id: int, today: str | None = None, top_n: int = 20
         "",
         f"- Clients debiteurs (au moins une facture echue non soldee) : **{len(rows)}**",
         f"- Reste du total sur factures echues : **{total_due:.2f} EUR**",
+        f"- Dont paiement partiel (prelevement automatique, HORS relances) : {partial_inv} factures, {partial_due:.2f} EUR",
         f"- Comptes 411 identifies via API v2 : {'oui' if accounts_411 else 'non (scope ledger_accounts:readonly absent ou filtre refuse -> colonne 411 vide)'}",
         "",
         "| Rang | Client | Email | Factures en retard | Reste du (EUR) | Comptes 411 |",
@@ -780,6 +829,7 @@ def fetch_top_debtors(company_id: int, today: str | None = None, top_n: int = 20
         "accounts_411": accounts_411,
         "debtor_count": len(rows),
         "total_due": total_due,
+        "partial_payment_excluded_from_relance": {"invoices": partial_inv, "due": partial_due},
         "top": top,
         "report_markdown": "\n".join(lines),
     }
@@ -876,6 +926,9 @@ REGLES METIER (appliquees par l'outil compute_relance_report) :
 - Une facture dont la date d'emission est IDENTIQUE a sa date d'echeance n'est PAS
   sujette a la 1re relance.
 - Ne jamais relancer une facture deja soldee (reste du = 0).
+- Une facture ayant recu un PAIEMENT PARTIEL (deja paye > 0 et reste du > 0) n'est
+  JAMAIS relancee, quel que soit le palier : le solde est encaisse par PRELEVEMENT
+  AUTOMATIQUE (compte dans excluded_partial_payment, hors du plan).
 
 ERREURS : si un outil renvoie une erreur, lis le message et explique clairement le
 probleme. Ne devine jamais un montant ni une date. Ne jamais afficher de token/cles.

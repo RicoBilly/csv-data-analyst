@@ -24,7 +24,9 @@ de relance (moteur déterministe existant `compute_relance_report`), puis exécu
 
 Règles métier déjà implémentées et à conserver : J = date d'échéance ; factures soldées ou
 non échues exclues ; **date d'émission = échéance → pas de 1re relance** ; aucune relance sur
-facture payée ; idempotence (jamais deux fois le même palier sur la même facture).
+facture payée ; **facture avec paiement partiel (déjà payé > 0, reste dû > 0) jamais relancée**
+(le solde est encaissé par prélèvement automatique — bucket `excluded_partial_payment`) ;
+idempotence (jamais deux fois le même palier sur la même facture).
 
 ## 2. Capacités vérifiées (besoin → solution → preuve)
 

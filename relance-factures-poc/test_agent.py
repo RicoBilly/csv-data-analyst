@@ -39,6 +39,7 @@ def sample_invoices():
         _inv(7, "FA-007", "Eta", "eta@example.com", "2026-10-01", "2026-10-15", "300.00", paid="300.00"),
         _inv(8, "FA-008", "Theta", "theta@example.com", "2026-11-01", "2026-11-27", "150.00"),
         _inv(9, "FA-009", "Iota", "iota@example.com", "2026-11-10", "2026-11-12", "75.00"),
+        _inv(10, "FA-010", "Kappa", "kappa@example.com", "2026-10-01", "2026-10-01", "600.00", paid="200.00"),
     ]
 
 
@@ -53,12 +54,14 @@ def test_compute_report() -> None:
     assert "FA-006" not in items and report["excluded_first_relance"] == [6]
     assert "FA-007" not in items and report["paid_ignored"] == 1
     assert "FA-008" not in items and "FA-009" not in items and report["not_due"] == 2
+    assert "FA-010" not in items and report["excluded_partial_payment"] == [10]
+    assert report["partial_payment_count"] == 1 and abs(report["partial_payment_due"] - 400.0) < 1e-6
     assert report["overdue_count"] == 5
     assert abs(report["total_due"] - (1200.00 + 800.00 + 2100.00 + 430.00 + 950.00)) < 1e-6
     assert report["by_stage"] == {"5": 1, "4": 1, "3": 1, "2": 1, "1": 1}
     md = report["report_markdown"]
     assert "Rapport a blanc" in md and "FA-005" in md and "Mise en demeure" in md
-    assert "exclusion" in md.lower()
+    assert "exclusion" in md.lower() and "prelevement" in md and "FA-010" in md
     print("compute_relance_report tests: OK")
 
 
@@ -136,6 +139,9 @@ def test_fetch_api_v2_tool() -> None:
                 {"id": 5, "invoice_number": "FA-5", "date": "2026-10-20", "deadline": "2026-11-06",
                  "currency": "EUR", "currency_amount": "80.00", "remaining_amount_with_tax": "80.00",
                  "paid": False, "status": "upcoming", "draft": False, "customer": {"id": 8}},
+                {"id": 6, "invoice_number": "FA-6", "date": "2026-09-01", "deadline": "2026-09-20",
+                 "currency": "EUR", "currency_amount": "500.00", "remaining_amount_with_tax": "500.00",
+                 "paid": False, "status": "late", "draft": False, "customer": {"id": 7}},
             ], "has_more": False},
         }
         calls = []
@@ -154,9 +160,9 @@ def test_fetch_api_v2_tool() -> None:
         finally:
             main._api_v2_get = orig_get
         assert out["source"] == "pennylane_api_v2" and out["pages_fetched"] == 2
-        assert out["customers_count"] == 2 and out["invoices_count"] == 3
+        assert out["customers_count"] == 2 and out["invoices_count"] == 4
         invs = {i["number"]: i for i in json.loads(out["invoices_json"])}
-        assert set(invs) == {"FA-1", "FA-2", "FA-5"}
+        assert set(invs) == {"FA-1", "FA-2", "FA-5", "FA-6"}
         assert invs["FA-1"]["amount_paid"] == 600.0 and invs["FA-1"]["customer_email"] == "a@acme.fr"
         assert invs["FA-2"]["amount_paid"] == 250.0 and invs["FA-2"]["customer_email"] == "b@beta.fr"
         assert invs["FA-5"]["amount_paid"] == 0.0 and invs["FA-5"]["deadline"] == "2026-11-06"
@@ -165,7 +171,9 @@ def test_fetch_api_v2_tool() -> None:
         assert "draft" in filter_arg and "credit_note" in filter_arg
         report = compute_relance_report(out["invoices_json"], today="2026-11-22")
         nums = {e["number"]: e for e in report["items"]}
-        assert nums["FA-1"]["stage"]["level"] == 3 and nums["FA-1"]["days_late"] == 52 and nums["FA-1"]["amount_due"] == 400.0
+        assert "FA-1" not in nums and report["excluded_partial_payment"] == [1]
+        assert report["partial_payment_count"] == 1 and abs(report["partial_payment_due"] - 400.0) < 1e-6
+        assert nums["FA-6"]["stage"]["level"] == 4 and nums["FA-6"]["days_late"] == 63 and nums["FA-6"]["amount_due"] == 500.0
         assert "FA-2" not in nums
         assert nums["FA-5"]["stage"]["level"] == 1 and nums["FA-5"]["days_late"] == 16
 
@@ -201,11 +209,14 @@ def test_top_debtors() -> None:
     assert out["debtor_count"] == 2 and abs(out["total_due"] - 1700.0) < 1e-6
     top = out["top"]
     assert top[0]["customer_name"] == "ACME" and top[0]["invoices_overdue"] == 2 and top[0]["total_due"] == 1400.0
+    assert top[0]["partial_invoices"] == 1 and abs(top[0]["partial_due"] - 400.0) < 1e-6
+    assert out["partial_payment_excluded_from_relance"] == {"invoices": 1, "due": 400.0}
     assert top[0]["balance_411"] == 1700.0 and abs(top[0]["gap_411_minus_invoices"] - 300.0) < 1e-6
     assert top[1]["customer_name"] == "BETA" and top[1]["invoices_overdue"] == 1 and top[1]["total_due"] == 300.0
     assert top[1]["balance_411"] == 250.0 and abs(top[1]["gap_411_minus_invoices"] - (-50.0)) < 1e-6
     md = out["report_markdown"]
     assert "Top 2" in md and "ACME" in md and "BETA" in md and "Ecart" in md and "GAMMA" not in md
+    assert "prelevement" in md
     out2 = top_debtors_report(json.dumps(invoices), "[]", today="2026-11-23", top_n=1)
     assert len(out2["top"]) == 1 and out2["top"][0]["balance_411"] is None
     try:
@@ -269,12 +280,14 @@ def test_fetch_top_debtors() -> None:
         assert out["debtor_count"] == 2 and abs(out["total_due"] - 1400.0) < 1e-6
         top = out["top"]
         assert top[0]["customer_name"] == "ACME" and top[0]["invoices_overdue"] == 2 and top[0]["total_due"] == 1100.0
+        assert top[0]["partial_invoices"] == 1 and abs(top[0]["partial_due"] - 100.0) < 1e-6
+        assert out["partial_payment_excluded_from_relance"] == {"invoices": 1, "due": 100.0}
         assert top[0]["balance_411"] is None and top[0]["gap_411_minus_invoices"] is None
         assert top[0]["accounts_411"] == ["411000001"]
         assert top[1]["customer_name"] == "BETA" and top[1]["total_due"] == 300.0 and top[1]["accounts_411"] == ["411000002"]
         md = out["report_markdown"]
         assert "Top 2" in md and "ACME" in md and "BETA" in md and "Banque" not in md and "F4" not in md
-        assert "Comptes 411" in md and "411000001" in md and "total_balance" in md
+        assert "Comptes 411" in md and "411000001" in md and "total_balance" in md and "prelevement" in md
 
         main._api_v2_get = make_fake(with_accounts="fallback")
         try:

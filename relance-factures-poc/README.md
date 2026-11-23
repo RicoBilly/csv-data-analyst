@@ -13,6 +13,9 @@ relance — aucun envoi, aucune écriture (garde-fou `ReadOnlyPennylaneGuardrail
   appel ciblé) · **J+90** mise en demeure (formel, courrier recommandé).
 - Facture dont la **date d'émission = date d'échéance** → **pas de 1re relance**.
 - Factures soldées (reste dû = 0) ou non encore échues → exclues.
+- Facture ayant reçu un **paiement partiel** (déjà payé > 0, reste dû > 0) → **jamais relancée** :
+  le solde est encaissé par **prélèvement automatique** (listée à part dans
+  `excluded_partial_payment`).
 
 ## Run locally
 
