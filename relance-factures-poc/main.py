@@ -897,8 +897,15 @@ def fetch_pennylane_email_templates(company_id: int, max_pages: int = 10) -> dic
     found = []
     for path, r in results.items():
         for it in r["items"]:
-            if _norm_key(it.get("name")) in wanted:
-                found.append({"path": path, "id": it.get("id"), "name": it.get("name"), "kind": it.get("kind")})
+            blob = _norm_key(" ".join(str(v) for v in it.values() if isinstance(v, str)))
+            if any(w in blob for w in wanted):
+                found.append({
+                    "path": path,
+                    "id": it.get("id"),
+                    "name": it.get("name") or it.get("label") or it.get("title"),
+                    "kind": it.get("kind"),
+                    "raw": it,
+                })
 
     lines = [
         f"# Modeles d'e-mail Pennylane - sonde API v2 (company_id {company_id})",
@@ -909,9 +916,10 @@ def fetch_pennylane_email_templates(company_id: int, max_pages: int = 10) -> dic
     for path, r in results.items():
         lines.append(f"## `{path}` - statut : {r['status']} - {r['count']} modele(s)")
         if r["items"]:
-            lines += ["", "| id | nom | kind |", "|---|---|---|"]
+            lines += ["", "| id | kind | autres champs |", "|---|---|---|"]
             for it in r["items"]:
-                lines.append(f"| {it.get('id')} | {it.get('name')} | {it.get('kind') or ''} |")
+                rest = {k: v for k, v in it.items() if k not in ("id", "kind")}
+                lines.append(f"| {it.get('id')} | {it.get('kind') or ''} | {json.dumps(rest, ensure_ascii=False)[:400]} |")
         lines.append("")
     lines.append(f"Modeles de relance impayee trouves (j+15 / j+30 / j+45) : {len(found)}")
     for f in found:

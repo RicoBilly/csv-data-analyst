@@ -317,13 +317,14 @@ def test_fetch_email_templates() -> None:
             if path == "/email_templates":
                 raise agents.ToolError("API Pennylane v2 /email_templates -> HTTP 403: scope missing")
             if path == "/billing_email_templates":
-                raise agents.ToolError("API Pennylane v2 /billing_email_templates -> HTTP 404: Not Found")
+                return {"items": [
+                    {"id": 21, "label": "Relance impayée j+15", "kind": "billing_email_invoice"},
+                    {"id": 22, "label": "Relance impayée j+30", "kind": "billing_email_invoice"},
+                    {"id": 23, "label": "Relance impayée j+45", "kind": "billing_email_invoice"},
+                ], "has_more": False}
             if path == "/customer_invoice_templates":
                 return {"items": [
                     {"id": 11, "name": "Facture standard"},
-                    {"id": 21, "name": "Relance impayée j+15", "kind": "billing_email_invoice"},
-                    {"id": 22, "name": "Relance impayée j+30", "kind": "billing_email_invoice"},
-                    {"id": 23, "name": "Relance impayée j+45", "kind": "billing_email_invoice"},
                 ], "has_more": False}
             raise AssertionError(f"unexpected path {path}")
 
@@ -335,8 +336,10 @@ def test_fetch_email_templates() -> None:
             main._api_v2_get = orig_get
         assert out["source"] == "pennylane_api_v2"
         assert "403" in out["results"]["/email_templates"]["status"]
-        assert "404" in out["results"]["/billing_email_templates"]["status"]
-        assert out["results"]["/customer_invoice_templates"]["count"] == 4
+        assert out["results"]["/customer_invoice_templates"]["status"] == "ok"
+        assert out["results"]["/customer_invoice_templates"]["count"] == 1
+        assert out["results"]["/billing_email_templates"]["status"] == "ok"
+        assert out["results"]["/billing_email_templates"]["count"] == 3
         found = {(f["id"], f["name"]) for f in out["relance_templates_found"]}
         assert found == {(21, "Relance impayée j+15"), (22, "Relance impayée j+30"), (23, "Relance impayée j+45")}
         md = out["report_markdown"]
