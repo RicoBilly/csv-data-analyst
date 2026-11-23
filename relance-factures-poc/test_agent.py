@@ -7,7 +7,7 @@ import os
 from mistralai import agents
 
 import main
-from main import ReadOnlyPennylaneGuardrail, compute_encours_report, compute_relance_report, fetch_pennylane_customer_invoices
+from main import ReadOnlyPennylaneGuardrail, compute_encours_report, compute_relance_report, fetch_pennylane_customer_invoices, top_debtors_report
 
 TODAY = "2026-11-22"
 
@@ -184,6 +184,38 @@ def test_fetch_api_v2_tool() -> None:
     print("fetch_pennylane_customer_invoices tests: OK")
 
 
+def test_top_debtors() -> None:
+    invoices = [
+        {"number": "F1", "customer_name": "ACME", "customer_email": "a@acme.fr", "date": "2026-10-01", "deadline": "2026-11-01", "amount": "1000", "amount_paid": "0", "currency": "EUR"},
+        {"number": "F2", "customer_name": "ACME", "customer_email": "a@acme.fr", "date": "2026-10-01", "deadline": "2026-11-10", "amount": "500", "amount_paid": "100", "currency": "EUR"},
+        {"number": "F3", "customer_name": "BETA", "customer_email": "b@beta.fr", "date": "2026-09-01", "deadline": "2026-10-01", "amount": "300", "amount_paid": "0", "currency": "EUR"},
+        {"number": "F4", "customer_name": "BETA", "customer_email": "b@beta.fr", "date": "2026-11-01", "deadline": "2026-12-01", "amount": "999", "amount_paid": "0", "currency": "EUR"},
+        {"number": "F5", "customer_name": "GAMMA", "customer_email": "g@g.fr", "date": "2026-09-01", "deadline": "2026-09-15", "amount": "50", "amount_paid": "50", "currency": "EUR"},
+    ]
+    accounts = [
+        {"number": "411000001", "label": "ACME", "total_balance": "1700.00"},
+        {"number": "411000002", "label": "Beta", "total_balance": "250.00"},
+        {"number": "411", "label": "ARCHIVE - Clients", "total_balance": "0.0"},
+    ]
+    out = top_debtors_report(json.dumps(invoices), json.dumps(accounts), today="2026-11-23", top_n=20)
+    assert out["debtor_count"] == 2 and abs(out["total_due"] - 1700.0) < 1e-6
+    top = out["top"]
+    assert top[0]["customer_name"] == "ACME" and top[0]["invoices_overdue"] == 2 and top[0]["total_due"] == 1400.0
+    assert top[0]["balance_411"] == 1700.0 and abs(top[0]["gap_411_minus_invoices"] - 300.0) < 1e-6
+    assert top[1]["customer_name"] == "BETA" and top[1]["invoices_overdue"] == 1 and top[1]["total_due"] == 300.0
+    assert top[1]["balance_411"] == 250.0 and abs(top[1]["gap_411_minus_invoices"] - (-50.0)) < 1e-6
+    md = out["report_markdown"]
+    assert "Top 2" in md and "ACME" in md and "BETA" in md and "Ecart" in md and "GAMMA" not in md
+    out2 = top_debtors_report(json.dumps(invoices), "[]", today="2026-11-23", top_n=1)
+    assert len(out2["top"]) == 1 and out2["top"][0]["balance_411"] is None
+    try:
+        top_debtors_report('{"x": 1}', "[]", today="2026-11-23")
+        raise AssertionError("should have raised")
+    except agents.ToolError as e:
+        assert "listes" in str(e)
+    print("top_debtors_report tests: OK")
+
+
 async def test_guardrail() -> None:
     guard = ReadOnlyPennylaneGuardrail()
 
@@ -210,6 +242,7 @@ async def test_guardrail() -> None:
     ) is None
     assert await guard.pre_tool_call(None, call("compute_relance_report", "client.compute_relance_report")) is None
     assert await guard.pre_tool_call(None, call("fetch_pennylane_customer_invoices", "client.fetch_pennylane_customer_invoices", {"company_id": 21994007})) is None
+    assert await guard.pre_tool_call(None, call("top_debtors_report", "client.top_debtors_report", {"invoices_json": "[]"})) is None
 
     for name, args in [
         ("run_operations", {"operation_id": "sendByEmailCustomerInvoice"}),
@@ -266,5 +299,6 @@ if __name__ == "__main__":
     test_compute_validation()
     test_compute_encours()
     test_fetch_api_v2_tool()
+    test_top_debtors()
     asyncio.run(main_async())
     print("ALL LOCAL CHECKS PASSED")
