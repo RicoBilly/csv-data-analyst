@@ -33,3 +33,6 @@ The deployed agent registers as a workflow named `relance-factures-poc`; run it 
 session with `execute_workflow` (input = session start message), and later attach a daily
 schedule with `create_workflow_schedule` (phase 2, nécessite des credentials workspace sur
 les connecteurs car les schedules n'ont pas d'utilisateur).
+
+Phase 2 (envois réels, brouillons Gmail J+60, mise en demeure Drive J+90, schedule
+quotidien, stats) : voir la revue de faisabilité [PHASE2-FAISABILITE.md](PHASE2-FAISABILITE.md).
