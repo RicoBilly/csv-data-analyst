@@ -54,19 +54,34 @@ Valeurs concrètes **fournies et vérifiées le 2026-11-23** (constantes `PHASE2
   `google_drive_mcp_search_files`).
 - **Modèles d'e-mail Pennylane de relance impayée** (kind `billing_email_invoice` attendu par
   `send_by_email`) : `Relance impayée j+15` (1re relance), `Relance impayée j+30` (2e),
-  `Relance impayée j+45` (3e). Leurs **IDs numériques** seront résolus à l'exécution via la
+  `Relance impayée j+45` (3e). Leurs **IDs numériques** sont résolus à l'exécution via la
   sonde lecture seule `fetch_pennylane_email_templates` (chemins sondés : `/email_templates`,
-  `/billing_email_templates`, `/customer_invoice_templates` — scope
-  `customer_invoice_templates:readonly` ou équivalent à ajouter à la clé si 403).
+  `/billing_email_templates`, `/customer_invoice_templates`).
+
+  **Résultat de la sonde exécutée en live le 2026-11-23** (déploiement `2e38202`, exécution
+  `aed1ca07…285d430`, aucun envoi effectué) :
+  - `GET /billing_email_templates` → **OK avec le token actuel** (aucun scope supplémentaire
+    nécessaire pour lister) : 5 modèles, dont **`Relance impayée j+15` = id `153549164544`**
+    (kind `billing_email_invoice`, locale `fr_FR`, sujet « Rappel – Facture N° {{numero}} en
+    attente de règlement »), plus `new quote`, `new invoice`, `Envoi devis ID Interactive`,
+    `Envoi facture ID Interactive`.
+  - **`Relance impayée j+30` et `j+45` sont ABSENTS** (`relance_templates_found = 1` sur 3
+    attendus) → à créer dans l'UI Pennylane avant la phase 2.
+  - `GET /email_templates` → **404** (chemin inexistant).
+  - `GET /customer_invoice_templates` → OK : 3 modèles de **PDF** de facture (« Modèle par
+    défaut », ids 81833/70730/70729) — sans lien avec les modèles d'e-mail de relance.
 
 Checklist restante :
 
-1. **Scope `customer_invoices:all`** sur la clé API Pennylane (à côté de `customers:readonly`,
-   `ledger_accounts:readonly`, et idéalement `customer_invoice_templates:readonly` pour la
-   résolution des IDs de modèles), puis mise à jour du secret workspace `cle_api_pennylane`
-   (la valeur change → re-lier le secret au déploiement, comme déjà fait en console).
-2. Les 3 modèles ci-dessus existent bien dans l'UI Pennylane (vérification automatisable via
-   la sonde ; sinon les créer).
+1. **Scope `customer_invoices:all`** sur la clé API Pennylane (à côté de `customers:readonly`
+   et `ledger_accounts:readonly` ; le listing des modèles d'e-mail fonctionne déjà avec le
+   token actuel via `/billing_email_templates`), puis mise à jour du secret workspace
+   `cle_api_pennylane` (la valeur change → re-lier le secret au déploiement, comme déjà
+   fait en console).
+2. **Créer `Relance impayée j+30` et `Relance impayée j+45` dans l'UI Pennylane** — seul
+   `Relance impayée j+15` existe (id `153549164544`, confirmé par la sonde en live le
+   2026-11-23). La sonde les retrouvera automatiquement par leur nom
+   (`PHASE2_CONFIG.relance_email_templates` dans `main.py`).
 3. **Connecteurs `gmail` et `google_drive_mcp`** déjà actifs et authentifiés sur le compte
    `eric.doyen@id-interactive.fr` ✅ ; pour les schedules (sans utilisateur), des
    **credentials workspace** seront peut-être nécessaires sur ces connecteurs.
