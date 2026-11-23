@@ -7,7 +7,7 @@ import os
 from mistralai import agents
 
 import main
-from main import ReadOnlyPennylaneGuardrail, compute_encours_report, compute_relance_report, fetch_pennylane_customer_invoices, fetch_top_debtors, top_debtors_report
+from main import ReadOnlyPennylaneGuardrail, compute_encours_report, compute_relance_report, fetch_pennylane_customer_invoices, fetch_pennylane_email_templates, fetch_top_debtors, top_debtors_report
 
 TODAY = "2026-11-22"
 
@@ -309,6 +309,52 @@ def test_fetch_top_debtors() -> None:
     print("fetch_top_debtors tests: OK")
 
 
+def test_fetch_email_templates() -> None:
+    os.environ[main.API_TOKEN_ENV] = "dummy-token-never-printed"
+    try:
+        def fake_get(path, params, company_id):
+            assert company_id == 21994007
+            if path == "/email_templates":
+                raise agents.ToolError("API Pennylane v2 /email_templates -> HTTP 403: scope missing")
+            if path == "/billing_email_templates":
+                raise agents.ToolError("API Pennylane v2 /billing_email_templates -> HTTP 404: Not Found")
+            if path == "/customer_invoice_templates":
+                return {"items": [
+                    {"id": 11, "name": "Facture standard"},
+                    {"id": 21, "name": "Relance impayée j+15", "kind": "billing_email_invoice"},
+                    {"id": 22, "name": "Relance impayée j+30", "kind": "billing_email_invoice"},
+                    {"id": 23, "name": "Relance impayée j+45", "kind": "billing_email_invoice"},
+                ], "has_more": False}
+            raise AssertionError(f"unexpected path {path}")
+
+        orig_get = main._api_v2_get
+        main._api_v2_get = fake_get
+        try:
+            out = fetch_pennylane_email_templates(21994007)
+        finally:
+            main._api_v2_get = orig_get
+        assert out["source"] == "pennylane_api_v2"
+        assert "403" in out["results"]["/email_templates"]["status"]
+        assert "404" in out["results"]["/billing_email_templates"]["status"]
+        assert out["results"]["/customer_invoice_templates"]["count"] == 4
+        found = {(f["id"], f["name"]) for f in out["relance_templates_found"]}
+        assert found == {(21, "Relance impayée j+15"), (22, "Relance impayée j+30"), (23, "Relance impayée j+45")}
+        md = out["report_markdown"]
+        assert "Relance impayée j+45" in md and "403" in md and "3" in md
+        assert main.PHASE2_CONFIG["gmail_account"] == "eric.doyen@id-interactive.fr"
+        assert main.PHASE2_CONFIG["drive_folder_title"] == "Relance-factures"
+        assert main.PHASE2_CONFIG["drive_folder_id"] == "1D3gWJnITWIpHHUKo13jgBClAmzWInDqP"
+        assert main.PHASE2_CONFIG["relance_email_templates"][1] == "Relance impayée j+15"
+        try:
+            fetch_pennylane_email_templates(0)
+            raise AssertionError("should have raised")
+        except agents.ToolError as e:
+            assert "entier positif" in str(e)
+    finally:
+        del os.environ[main.API_TOKEN_ENV]
+    print("fetch_pennylane_email_templates tests: OK")
+
+
 async def test_guardrail() -> None:
     guard = ReadOnlyPennylaneGuardrail()
 
@@ -395,5 +441,6 @@ if __name__ == "__main__":
     test_fetch_api_v2_tool()
     test_top_debtors()
     test_fetch_top_debtors()
+    test_fetch_email_templates()
     asyncio.run(main_async())
     print("ALL LOCAL CHECKS PASSED")

@@ -16,6 +16,7 @@ Aucun envoi, aucune ecriture : le garde-fou bloque tout outil non autorise.
 import json
 import os
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,6 +31,23 @@ PENNYLANE_API_BASE = "https://app.pennylane.com/api/external/v2"
 # le nom du secret comme nom de variable d'env.
 API_TOKEN_ENV = "PENNYLANE_API_TOKEN"
 API_TOKEN_ENV_FALLBACK = "cle_api_pennylane"
+
+# Config phase 2 (envois reels) - valeurs fournies et VERIFIEES le 2026-11-23 :
+# - compte Gmail du connecteur gmail : eric.doyen@id-interactive.fr (verifie via from:me)
+# - dossier Drive "Relance-factures" : id 1D3gWJnITWIpHHUKo13jgBClAmzWInDqP, owner
+#   eric.doyen@id-interactive.fr, can_add_children=true, vide a la creation
+# - modeles d'email Pennylane de relance impayee (kind billing_email_invoice), a
+#   resoudre en id via fetch_pennylane_email_templates avant tout send_by_email
+PHASE2_CONFIG = {
+    "gmail_account": "eric.doyen@id-interactive.fr",
+    "drive_folder_title": "Relance-factures",
+    "drive_folder_id": "1D3gWJnITWIpHHUKo13jgBClAmzWInDqP",
+    "relance_email_templates": {
+        1: "Relance impayée j+15",
+        2: "Relance impayée j+30",
+        3: "Relance impayée j+45",
+    },
+}
 
 # Outils curates officiels du MCP Pennylane (allow-list 100% lecture seule cote serveur) :
 # https://pennylane-mcp.readme.io/docs/getting-started
@@ -835,6 +853,77 @@ def fetch_top_debtors(company_id: int, today: str | None = None, top_n: int = 20
     }
 
 
+def _norm_key(s: Any) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", str(s or "")) if not unicodedata.combining(c)).upper()
+
+
+@agents.tool
+def fetch_pennylane_email_templates(company_id: int, max_pages: int = 10) -> dict[str, Any]:
+    """Sonde LECTURE SEULE (GET) des modeles d'e-mail de facturation Pennylane (API v2).
+
+    company_id : identifiant Pennylane (ex. 21994007), transmis en header X-Company-Id.
+    max_pages : securite pagination par chemin sonde (defaut 10 pages de 100).
+
+    Sonde les chemins candidats /email_templates, /billing_email_templates et
+    /customer_invoice_templates. Pour chacun, retourne : status ("ok" ou message
+    d'erreur HTTP sanitize, jamais de token), count et items {id, name, kind, ...}.
+    Sert a verifier que les modeles "Relance impayee j+15 / j+30 / j+45" existent et a
+    recuperer leur id (email_template_id pour POST /customer_invoices/{id}/send_by_email
+    en phase 2). Aucun envoi, aucune modification.
+
+    Retourne un dict : source="pennylane_api_v2", results (par chemin),
+    relance_templates_found (liste {path, id, name, kind}) et report_markdown.
+    """
+    if not isinstance(company_id, int) or company_id <= 0:
+        raise agents.ToolError("company_id doit etre un entier positif (ex. 21994007).")
+    results: dict[str, Any] = {}
+    for path in ("/email_templates", "/billing_email_templates", "/customer_invoice_templates"):
+        items: list[dict[str, Any]] = []
+        status = "ok"
+        try:
+            cursor = None
+            for _ in range(max_pages):
+                data = _api_v2_get(path, {"limit": 100, "cursor": cursor}, company_id)
+                items.extend(data.get("items", []))
+                if not data.get("has_more"):
+                    break
+                cursor = data.get("next_cursor")
+                time.sleep(0.3)
+        except agents.ToolError as e:
+            status = str(e)
+        results[path] = {"status": status, "count": len(items), "items": items[:100]}
+
+    wanted = {_norm_key(v) for v in PHASE2_CONFIG["relance_email_templates"].values()}
+    found = []
+    for path, r in results.items():
+        for it in r["items"]:
+            if _norm_key(it.get("name")) in wanted:
+                found.append({"path": path, "id": it.get("id"), "name": it.get("name"), "kind": it.get("kind")})
+
+    lines = [
+        f"# Modeles d'e-mail Pennylane - sonde API v2 (company_id {company_id})",
+        "",
+        "POC lecture seule : aucun envoi effectue, aucune donnee modifiee.",
+        "",
+    ]
+    for path, r in results.items():
+        lines.append(f"## `{path}` - statut : {r['status']} - {r['count']} modele(s)")
+        if r["items"]:
+            lines += ["", "| id | nom | kind |", "|---|---|---|"]
+            for it in r["items"]:
+                lines.append(f"| {it.get('id')} | {it.get('name')} | {it.get('kind') or ''} |")
+        lines.append("")
+    lines.append(f"Modeles de relance impayee trouves (j+15 / j+30 / j+45) : {len(found)}")
+    for f in found:
+        lines.append(f"- `{f['path']}` id={f['id']} name=\"{f['name']}\" kind={f.get('kind')}")
+    return {
+        "source": "pennylane_api_v2",
+        "results": results,
+        "relance_templates_found": found,
+        "report_markdown": "\n".join(lines),
+    }
+
+
 class ReadOnlyPennylaneGuardrail(agents.Hook):
     """N'autorise que les outils Pennylane curates en lecture seule et les outils client.*.
 
@@ -902,6 +991,10 @@ PROTOCOLE :
    report_markdown + 'Aucun envoi effectue (POC lecture seule).'
 6. Variante si fetch_top_debtors est indisponible : top_debtors_report(invoices_json=...,
    accounts_json=<comptes 411 MCP>, today=..., top_n=N).
+7. Si l'utilisateur demande de VERIFIER les prerequis phase 2 (modeles d'email de
+   relance Pennylane "Relance impayee j+15/j+30/j+45") : appelle UNIQUEMENT
+   fetch_pennylane_email_templates(company_id=<id>) et reponds avec son
+   report_markdown + 'Aucun envoi effectue (POC lecture seule).'
 
 FALLBACK (uniquement si l'etape 2 echoue, ex. 401/403/429 ou reseau) :
 a. list_accounts(company_id=<id>, number_prefix="411", page=1..N) en paginant
@@ -939,7 +1032,7 @@ agent = agents.Agent(
     name="relance-factures-poc",
     description="POC lecture seule : lit les factures clients impayees dans Pennylane (connexion de l'utilisateur) et produit un rapport a blanc du plan de relance J+15/30/45/60/90. Aucun envoi.",
     instructions=INSTRUCTIONS,
-    tools=[compute_relance_report, compute_encours_report, fetch_pennylane_customer_invoices, top_debtors_report, fetch_top_debtors],
+    tools=[compute_relance_report, compute_encours_report, fetch_pennylane_customer_invoices, top_debtors_report, fetch_top_debtors, fetch_pennylane_email_templates],
     connectors=[agents.connector("pennylane_e376")],
     builtins=agents.Builtins(skills=False, subagents=False),
     guardrails=[ReadOnlyPennylaneGuardrail()],

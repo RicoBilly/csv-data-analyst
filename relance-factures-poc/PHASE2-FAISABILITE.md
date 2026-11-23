@@ -44,18 +44,35 @@ idempotence (jamais deux fois le même palier sur la même facture).
 
 ## 3. Prérequis côté utilisateur (checklist avant v9)
 
+Valeurs concrètes **fournies et vérifiées le 2026-11-23** (constantes `PHASE2_CONFIG` dans
+`main.py`) :
+
+- **Compte e-mail** : `eric.doyen@id-interactive.fr` — vérifié : le connecteur `gmail` est
+  authentifié sur ce compte (recherche `from:me` → expéditeur `eric.doyen@id-interactive.fr`).
+- **Dossier Drive** : `Relance-factures`, id `1D3gWJnITWIpHHUKo13jgBClAmzWInDqP`, propriétaire
+  `eric.doyen@id-interactive.fr`, `can_add_children=true`, vide à la création (vérifié via
+  `google_drive_mcp_search_files`).
+- **Modèles d'e-mail Pennylane de relance impayée** (kind `billing_email_invoice` attendu par
+  `send_by_email`) : `Relance impayée j+15` (1re relance), `Relance impayée j+30` (2e),
+  `Relance impayée j+45` (3e). Leurs **IDs numériques** seront résolus à l'exécution via la
+  sonde lecture seule `fetch_pennylane_email_templates` (chemins sondés : `/email_templates`,
+  `/billing_email_templates`, `/customer_invoice_templates` — scope
+  `customer_invoice_templates:readonly` ou équivalent à ajouter à la clé si 403).
+
+Checklist restante :
+
 1. **Scope `customer_invoices:all`** sur la clé API Pennylane (à côté de `customers:readonly`,
-   `ledger_accounts:readonly`), puis mise à jour du secret workspace `cle_api_pennylane`
+   `ledger_accounts:readonly`, et idéalement `customer_invoice_templates:readonly` pour la
+   résolution des IDs de modèles), puis mise à jour du secret workspace `cle_api_pennylane`
    (la valeur change → re-lier le secret au déploiement, comme déjà fait en console).
-2. **3 modèles d'e-mail de facturation** créés dans l'UI Pennylane (kind `billing_email_invoice`) :
-   « Relance 1 — J+15 (très cordial) », « Relance 2 — J+30 (courtois) », « Relance 3 — J+45
-   (plus ferme) » ; leurs IDs seront en config de l'agent.
-3. **Connecteurs `gmail` et `google_drive_mcp`** rattachés au bon compte Google (déjà actifs
-   et authentifiés dans ce workspace) + droits sur le dossier Drive choisi ; pour les
-   schedules (sans utilisateur), des **credentials workspace** seront peut-être nécessaires
-   sur ces connecteurs.
-4. **Dossier Drive dédié** (ex. `Relances ID Interactive/`) avec sous-dossiers `rapports/`,
-   `Mises en demeure/`.
+2. Les 3 modèles ci-dessus existent bien dans l'UI Pennylane (vérification automatisable via
+   la sonde ; sinon les créer).
+3. **Connecteurs `gmail` et `google_drive_mcp`** déjà actifs et authentifiés sur le compte
+   `eric.doyen@id-interactive.fr` ✅ ; pour les schedules (sans utilisateur), des
+   **credentials workspace** seront peut-être nécessaires sur ces connecteurs.
+4. Dossier Drive `Relance-factures` ✅ — y créer les sous-dossiers `rapports/`,
+   `Mises en demeure/` et le journal `journal-relances.json` (créés automatiquement par
+   l'agent en phase 2 s'ils n'existent pas).
 
 ## 4. Architecture proposée (v9)
 
