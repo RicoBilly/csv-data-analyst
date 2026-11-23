@@ -621,13 +621,16 @@ def fetch_top_debtors(company_id: int, today: str | None = None, top_n: int = 20
     Appels API v2 effectues en GET uniquement (token lu dans l'environnement du worker,
     jamais passe en argument ni affiche) :
     - GET /customers (noms/emails) ;
-    - GET /ledger_accounts, filtre local number commencant par "411" (si le scope
-      ledger_accounts:readonly est absent -> 403, la colonne solde 411 est alors non
-      renseignee et accounts_411=false) ;
+    - GET /ledger_accounts?filter=[number start_with "411"] (limit 1000 ; repli sur un
+      appel non filtre + filtre local si le filtre est refuse ; si le scope
+      ledger_accounts:readonly est absent -> 403, accounts_411=false). ATTENTION : l'API v2
+      ne renvoie AUCUN solde sur ledger_accounts (pas de champ total_balance) -> on ne
+      recupere que les numeros de comptes 411 ; les soldes 411 sont lus via MCP
+      list_accounts (voir compute_encours_report) ;
     - GET /customer_invoices?filter=[draft=false, credit_note=false], pagine par cursor,
       agrege A LA VOLEE par client (aucune grosse donnee ne transite par l'agent) :
       nb de factures en retard (echeance <= today, reste du > 0) et total du reste du,
-      croises avec le solde du/des compte(s) 411 dont le label = nom du client.
+      croises avec les numeros du/des compte(s) 411 dont le label = nom du client.
 
     Retourne un dict : debtor_count, total_due, accounts_411, source="pennylane_api_v2",
     top (liste triee par reste du decroissant) et report_markdown (tableau markdown).
@@ -660,23 +663,30 @@ def fetch_top_debtors(company_id: int, today: str | None = None, top_n: int = 20
 
     acc_by_name: dict[str, dict[str, Any]] = {}
     accounts_411 = False
-    try:
+    acc_filter = json.dumps([{"field": "number", "operator": "start_with", "value": "411"}])
+
+    def _read_ledger_accounts(params: dict[str, Any]) -> None:
         cursor = None
         for _ in range(30):
-            data = _api_v2_get("/ledger_accounts", {"limit": 100, "cursor": cursor}, company_id)
+            data = _api_v2_get("/ledger_accounts", {**params, "cursor": cursor}, company_id)
             for a in data.get("items", []):
                 if not str(a.get("number") or "").startswith("411"):
                     continue
                 key = _norm_name(a.get("label"))
                 if not key:
                     continue
-                cur = acc_by_name.setdefault(key, {"balance": 0.0, "numbers": []})
-                cur["balance"] += _to_float(a.get("total_balance"))
-                cur["numbers"].append(a.get("number"))
+                acc_by_name.setdefault(key, {"numbers": []})["numbers"].append(a.get("number"))
             if not data.get("has_more"):
                 break
             cursor = data.get("next_cursor")
             time.sleep(0.3)
+
+    try:
+        try:
+            _read_ledger_accounts({"limit": 1000, "filter": acc_filter})
+        except agents.ToolError:
+            acc_by_name.clear()
+            _read_ledger_accounts({"limit": 1000})
         accounts_411 = True
     except agents.ToolError:
         accounts_411 = False
@@ -731,9 +741,9 @@ def fetch_top_debtors(company_id: int, today: str | None = None, top_n: int = 20
             "invoices_overdue": d["invoices_overdue"],
             "total_due": d["total_due"],
             "currency": "EUR" if not d["non_eur"] else d["currency"] + " (mixte)",
-            "balance_411": round(acc["balance"], 2) if acc else None,
+            "balance_411": None,
             "accounts_411": acc["numbers"] if acc else [],
-            "gap_411_minus_invoices": round(acc["balance"] - d["total_due"], 2) if acc else None,
+            "gap_411_minus_invoices": None,
         })
     rows.sort(key=lambda r: -r["total_due"])
     top = rows[:top_n]
@@ -746,20 +756,21 @@ def fetch_top_debtors(company_id: int, today: str | None = None, top_n: int = 20
         "",
         f"- Clients debiteurs (au moins une facture echue non soldee) : **{len(rows)}**",
         f"- Reste du total sur factures echues : **{total_due:.2f} EUR**",
-        f"- Comptes 411 lus via API v2 : {'oui' if accounts_411 else 'non (scope ledger_accounts:readonly absent -> colonne 411 non renseignee)'}",
+        f"- Comptes 411 identifies via API v2 : {'oui' if accounts_411 else 'non (scope ledger_accounts:readonly absent ou filtre refuse -> colonne 411 vide)'}",
         "",
-        "| Rang | Client | Email | Factures en retard | Reste du (EUR) | Solde compte 411 | Ecart (411 - factures) |",
-        "|---|---|---|---|---|---|---|",
+        "| Rang | Client | Email | Factures en retard | Reste du (EUR) | Comptes 411 |",
+        "|---|---|---|---|---|---|",
     ]
     for i, r in enumerate(top, 1):
-        bal = f"{r['balance_411']:.2f}" if r["balance_411"] is not None else "—"
-        gap = f"{r['gap_411_minus_invoices']:.2f}" if r["gap_411_minus_invoices"] is not None else "—"
-        lines.append(f"| {i} | {r['customer_name']} | {r['customer_email'] or ''} | {r['invoices_overdue']} | {r['total_due']:.2f} | {bal} | {gap} |")
+        accs = ", ".join(r["accounts_411"]) if r["accounts_411"] else "—"
+        lines.append(f"| {i} | {r['customer_name']} | {r['customer_email'] or ''} | {r['invoices_overdue']} | {r['total_due']:.2f} | {accs} |")
     lines += [
         "",
         "Lecture : 'Reste du' = somme des factures echues non soldees (API v2, meme base que l'app",
-        "Pennylane) ; 'Solde compte 411' = solde comptable du compte client (peut contenir des",
-        "ecritures hors factures) ; l'ecart explique les differences entre l'app et la comptabilite.",
+        "Pennylane). L'API v2 ne renvoie pas le solde des comptes du grand livre (ledger_accounts",
+        "sans total_balance) : le solde comptable 411 de chaque client se lit via MCP list_accounts",
+        "(voir compute_encours_report) ; il peut contenir des ecritures hors factures, d'ou des",
+        "ecarts entre l'encours de l'app et la comptabilite.",
     ]
     return {
         "today": run_date.isoformat(),
