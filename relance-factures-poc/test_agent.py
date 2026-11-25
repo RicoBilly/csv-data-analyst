@@ -1,13 +1,15 @@
 """Local checks for the relance-factures POC: tool unit tests, guardrail tests, scripted run (no API key needed)."""
 
 import asyncio
+import base64
 import json
 import os
+from datetime import timedelta
 
 from mistralai import agents
 
 import main
-from main import ReadOnlyPennylaneGuardrail, compute_encours_report, compute_relance_report, fetch_pennylane_customer_invoices, fetch_pennylane_email_templates, fetch_top_debtors, top_debtors_report
+from main import RelanceGuardrail, compute_encours_report, compute_relance_report, fetch_invoice_pdf_base64, fetch_pennylane_customer_invoices, fetch_pennylane_email_templates, fetch_relance_plan, fetch_top_debtors, send_pennylane_invoice_email, top_debtors_report
 
 TODAY = "2026-11-22"
 
@@ -359,7 +361,7 @@ def test_fetch_email_templates() -> None:
 
 
 async def test_guardrail() -> None:
-    guard = ReadOnlyPennylaneGuardrail()
+    guard = RelanceGuardrail()
 
     def call(tool_name, tool_id, arguments=None):
         return agents.hook.PreToolCall(
@@ -379,31 +381,59 @@ async def test_guardrail() -> None:
         "list_quotes",  # outil curate list_* non liste explicitement : autorise par prefixe
     ):
         assert await guard.pre_tool_call(None, call(tool_name, f"connector_pennylane_e376.{tool_name}")) is None, tool_name
-    assert await guard.pre_tool_call(
-        None, call("run_operations", "connector_pennylane_e376.run_operations", {"operation_id": "getCustomerInvoices"})
-    ) is None
-    assert await guard.pre_tool_call(None, call("compute_relance_report", "client.compute_relance_report")) is None
-    assert await guard.pre_tool_call(None, call("fetch_pennylane_customer_invoices", "client.fetch_pennylane_customer_invoices", {"company_id": 21994007})) is None
-    assert await guard.pre_tool_call(None, call("top_debtors_report", "client.top_debtors_report", {"invoices_json": "[]"})) is None
-    assert await guard.pre_tool_call(None, call("fetch_top_debtors", "client.fetch_top_debtors", {"company_id": 21994007, "top_n": 20})) is None
 
-    for name, args in [
-        ("run_operations", {"operation_id": "sendByEmailCustomerInvoice"}),
-        ("run_operations", {"operation_id": "postCustomerInvoiceReminder"}),
-        ("run_operations", {"operation_id": "markAsPaidCustomerInvoice"}),
-    ]:
-        decision = await guard.pre_tool_call(None, call(name, "connector_pennylane_e376.run_operations", args))
+    # run_operations bloque en phase 2, meme en lecture (les outils client.* remplacent l'API v2 directe)
+    for args in ({"operation_id": "getCustomerInvoices"}, {"operation_id": "sendByEmailCustomerInvoice"}):
+        decision = await guard.pre_tool_call(None, call("run_operations", "connector_pennylane_e376.run_operations", args))
         assert decision is not None and decision.kind == "skip", args
 
     for tool_name in ("create_invoice", "delete_customer", "send_reminder", "unknown_tool"):
         decision = await guard.pre_tool_call(None, call(tool_name, f"connector_pennylane_e376.{tool_name}"))
         assert decision is not None and decision.kind == "skip", tool_name
 
-    decision = await guard.pre_tool_call(None, call("create_draft", "connector_gmail.create_draft"))
-    assert decision is not None and decision.kind == "skip"
+    # outils client.* (y compris les 3 outils serveur phase 2) : autorises
+    for tool_name in (
+        "compute_relance_report",
+        "fetch_pennylane_customer_invoices",
+        "top_debtors_report",
+        "fetch_top_debtors",
+        "fetch_relance_plan",
+        "send_pennylane_invoice_email",
+        "fetch_invoice_pdf_base64",
+    ):
+        assert await guard.pre_tool_call(None, call(tool_name, f"client.{tool_name}", {"company_id": 21994007})) is None, tool_name
+
+    # Gmail : brouillon + lectures autorises, envois/suppressions bloques
+    for tool_name, tool_id in (
+        ("gmail_create_draft", "connector_gmail.gmail_create_draft"),
+        ("create_draft", "connector_gmail.create_draft"),
+        ("gmail_search_threads", "connector_gmail.gmail_search_threads"),
+        ("gmail_get_thread", "connector_gmail.gmail_get_thread"),
+    ):
+        assert await guard.pre_tool_call(None, call(tool_name, tool_id)) is None, tool_name
+    for tool_name in ("gmail_send_email", "gmail_send_draft", "gmail_delete_message", "gmail_delete_label"):
+        decision = await guard.pre_tool_call(None, call(tool_name, f"connector_gmail.{tool_name}"))
+        assert decision is not None and decision.kind == "skip", tool_name
+
+    # Drive : lectures + create/update/copy autorises, suppressions/permissions bloques
+    for tool_name, tool_id in (
+        ("google_drive_mcp_search_files", "connector_google_drive_mcp.google_drive_mcp_search_files"),
+        ("search_files", "connector_google_drive_mcp.search_files"),
+        ("google_drive_mcp_read_file_content", "connector_google_drive_mcp.google_drive_mcp_read_file_content"),
+        ("google_drive_mcp_create_file", "connector_google_drive_mcp.google_drive_mcp_create_file"),
+        ("google_drive_mcp_update_file", "connector_google_drive_mcp.google_drive_mcp_update_file"),
+        ("google_drive_mcp_copy_file", "connector_google_drive_mcp.google_drive_mcp_copy_file"),
+    ):
+        assert await guard.pre_tool_call(None, call(tool_name, tool_id)) is None, tool_name
+    for tool_name in ("google_drive_mcp_delete_file", "delete_file", "google_drive_mcp_get_file_permissions", "google_drive_mcp_update_file_permissions", "google_drive_mcp_share_file"):
+        decision = await guard.pre_tool_call(None, call(tool_name, f"connector_google_drive_mcp.{tool_name}"))
+        assert decision is not None and decision.kind == "skip", tool_name
+
     decision = await guard.pre_tool_call(None, call("run_typescript", "run_typescript"))
     assert decision is not None and decision.kind == "skip"
-    print("guardrail tests: OK")
+    decision = await guard.pre_tool_call(None, call("send_sms", "connector_allo_c229.allo_send_sms"))
+    assert decision is not None and decision.kind == "skip"
+    print("guardrail v2 tests: OK")
 
 
 async def test_scripted_agent() -> None:
@@ -421,7 +451,7 @@ async def test_scripted_agent() -> None:
         instructions=main.INSTRUCTIONS,
         tools=[compute_relance_report],
         builtins=agents.Builtins(skills=False, subagents=False),
-        guardrails=[ReadOnlyPennylaneGuardrail()],
+        guardrails=[RelanceGuardrail()],
     ).override(model=scripted)
     async with agents.local_runtime():
         state = await agent.run("Produis le rapport a blanc des relances.")
@@ -437,6 +467,259 @@ async def main_async() -> None:
     await test_scripted_agent()
 
 
+def test_fetch_relance_plan() -> None:
+    os.environ[main.API_TOKEN_ENV] = "dummy-token-never-printed"
+    today = agents.now().date()
+
+    def d(days: int) -> str:
+        return (today - timedelta(days=days)).isoformat()
+
+    def fake_get(path, params, company_id):
+        assert company_id == 21994007
+        if path == "/me":
+            return {"scopes": ["customers:readonly", "customer_invoices:all"]}
+        if path == "/customers":
+            return {"items": [{"id": 7, "name": "ACME", "emails": ["a@acme.fr"]}], "has_more": False}
+        if path == "/customer_invoices":
+            return {"items": [
+                {"id": 1, "invoice_number": "FA-1", "date": d(80), "deadline": d(51), "currency": "EUR", "currency_amount": "1000.00", "remaining_amount_with_tax": "1000.00", "paid": False, "status": "late", "customer": {"id": 7}},
+                {"id": 2, "invoice_number": "FA-2", "date": d(60), "deadline": d(35), "currency": "EUR", "currency_amount": "500.00", "remaining_amount_with_tax": "500.00", "paid": False, "status": "late", "customer": {"id": 7}},
+                {"id": 3, "invoice_number": "FA-3", "date": d(40), "deadline": d(17), "currency": "EUR", "currency_amount": "200.00", "remaining_amount_with_tax": "200.00", "paid": False, "status": "late", "customer": {"id": 7}},
+                {"id": 4, "invoice_number": "FA-4", "date": d(120), "deadline": d(94), "currency": "EUR", "currency_amount": "300.00", "remaining_amount_with_tax": "300.00", "paid": False, "status": "late", "customer": {"id": 7}},
+                {"id": 5, "invoice_number": "FA-5", "date": d(90), "deadline": d(63), "currency": "EUR", "currency_amount": "400.00", "remaining_amount_with_tax": "400.00", "paid": False, "status": "late", "customer": {"id": 7}},
+            ], "has_more": False}
+        raise AssertionError(f"unexpected path {path}")
+
+    try:
+        orig_get = main._api_v2_get
+        main._api_v2_get = fake_get
+        try:
+            journal = [{"invoice_id": 2, "stage": 2, "channel": "pennylane_email", "at": f"{today.isoformat()}T08:00:00+01:00", "dry_run": False}]
+            out = fetch_relance_plan(21994007, today=today.isoformat(), journal_json=json.dumps(journal))
+        finally:
+            main._api_v2_get = orig_get
+        assert out["source"] == "pennylane_api_v2" and out["scopes_ok"] is True
+        assert out["invoices_seen"] == 5 and out["pages_fetched"] == 1
+        nums = {e["number"]: e for e in out["plan"]}
+        assert set(nums) == {"FA-1", "FA-3", "FA-4", "FA-5"}
+        assert nums["FA-1"]["stage"]["level"] == 3 and nums["FA-1"]["action"] == "pennylane_email"
+        assert nums["FA-3"]["stage"]["level"] == 1 and nums["FA-3"]["action"] == "pennylane_email"
+        assert nums["FA-5"]["stage"]["level"] == 4 and nums["FA-5"]["action"] == "gmail_draft"
+        assert nums["FA-4"]["stage"]["level"] == 5 and nums["FA-4"]["action"] == "drive_letter"
+        assert [x["invoice_id"] for x in out["excluded_by_journal"]] == [2]
+        assert out["by_stage"] == {"1": 1, "3": 1, "4": 1, "5": 1}
+        assert abs(out["total_due"] - 1900.0) < 1e-6
+        assert "Plan de relance du" in out["report_markdown"] and "FA-2" in out["report_markdown"]
+
+        # une entree dry_run dans le journal n'exclut PAS la facture du plan
+        main._api_v2_get = fake_get
+        try:
+            journal_dry = [{"invoice_id": 2, "stage": 2, "channel": "pennylane_email", "at": f"{today.isoformat()}T08:00:00+01:00", "dry_run": True}]
+            out2 = fetch_relance_plan(21994007, today=today.isoformat(), journal_json=json.dumps(journal_dry))
+        finally:
+            main._api_v2_get = orig_get
+        assert {e["number"] for e in out2["plan"]} == {"FA-1", "FA-2", "FA-3", "FA-4", "FA-5"}
+
+        for bad in (0, -3):
+            try:
+                fetch_relance_plan(bad)
+                raise AssertionError("should have raised")
+            except agents.ToolError as e:
+                assert "entier positif" in str(e)
+        try:
+            fetch_relance_plan(21994007, today="not-a-date")
+            raise AssertionError("should have raised")
+        except agents.ToolError as e:
+            assert "YYYY-MM-DD" in str(e)
+        try:
+            fetch_relance_plan(21994007, journal_json='{"x": 1}')
+            raise AssertionError("should have raised")
+        except agents.ToolError as e:
+            assert "liste" in str(e)
+    finally:
+        del os.environ[main.API_TOKEN_ENV]
+    print("fetch_relance_plan tests: OK")
+
+
+def test_send_pennylane_invoice_email() -> None:
+    os.environ[main.API_TOKEN_ENV] = "dummy-token-never-printed"
+    os.environ.pop(main.RELANCE_DRY_RUN_ENV, None)
+    today = agents.now().date()
+    deadline = (today - timedelta(days=20)).isoformat()
+    issue = (today - timedelta(days=80)).isoformat()
+    inv = {"id": 5, "invoice_number": "FA-5", "date": issue, "deadline": deadline,
+           "currency": "EUR", "currency_amount": "800.00", "remaining_amount_with_tax": "800.00",
+           "paid": False, "status": "late", "customer": {"id": 7, "emails": ["a@acme.fr"]}}
+
+    def fake_get(path, params, company_id):
+        assert company_id == 21994007
+        if path == "/customer_invoices/5":
+            return inv
+        if path == "/me":
+            return {"scopes": ["customers:readonly", "customer_invoices:all"]}
+        if path == "/billing_email_templates":
+            return {"items": [
+                {"id": 153549164544, "name": "Relance impayée j+15", "kind": "billing_email_invoice"},
+                {"id": 22, "name": "Relance impayée j+30", "kind": "billing_email_invoice"},
+                {"id": 23, "name": "Relance impayée j+45", "kind": "billing_email_invoice"},
+            ], "has_more": False}
+        raise AssertionError(f"unexpected path {path}")
+
+    posts = []
+
+    def fake_post(path, params, company_id, body=None):
+        posts.append((path, company_id, body))
+        return 204, None
+
+    orig_get, orig_post = main._api_v2_get, main._api_v2_post
+    main._api_v2_get, main._api_v2_post = fake_get, fake_post
+    try:
+        # dry-run par defaut (env non defini -> true) : aucun POST
+        out = send_pennylane_invoice_email(21994007, 5, 1, journal_json="[]")
+        assert out["dry_run"] is True and out["sent"] is False and not posts
+        assert out["template_id"] == 153549164544 and out["customer_email"] == "a@acme.fr"
+        entry = out["journal_entry"]
+        assert entry["invoice_id"] == 5 and entry["stage"] == 1 and entry["dry_run"] is True
+        assert len(json.loads(out["journal_json"])) == 1
+
+        # dry_run=False : POST effectue avec le bon template
+        out2 = send_pennylane_invoice_email(21994007, 5, 1, dry_run=False, journal_json="[]")
+        assert out2["sent"] is True and out2["status_http"] == 204
+        assert posts == [("/customer_invoices/5/send_by_email", 21994007, {"email_template_id": 153549164544})]
+        assert json.loads(out2["journal_json"])[0]["dry_run"] is False
+
+        # anti-doublon : meme facture/palier deja envoyee (non dry-run) -> refuse
+        try:
+            send_pennylane_invoice_email(21994007, 5, 1, dry_run=False, journal_json=out2["journal_json"])
+            raise AssertionError("should have raised")
+        except agents.ToolError as e:
+            assert "deja relancee" in str(e)
+
+        # une entree dry_run dans le journal ne bloque PAS un envoi reel
+        out3 = send_pennylane_invoice_email(21994007, 5, 1, dry_run=False, journal_json=out["journal_json"])
+        assert out3["sent"] is True
+
+        # palier demande != palier calcule (20 j de retard -> palier 1, demande stage 2)
+        try:
+            send_pennylane_invoice_email(21994007, 5, 2, dry_run=True, journal_json="[]")
+            raise AssertionError("should have raised")
+        except agents.ToolError as e:
+            assert "palier attendu 1" in str(e)
+
+        # stage hors 1-3 (J+60/J+90 ne passent pas par cet outil)
+        try:
+            send_pennylane_invoice_email(21994007, 5, 4, dry_run=True)
+            raise AssertionError("should have raised")
+        except agents.ToolError as e:
+            assert "stage doit etre" in str(e)
+
+        # facture soldee -> refuse
+        main._api_v2_get = lambda path, params, company_id: (dict(inv, remaining_amount_with_tax="0.00", paid=True, status="paid") if path == "/customer_invoices/5" else fake_get(path, params, company_id))
+        try:
+            send_pennylane_invoice_email(21994007, 5, 1, dry_run=True)
+            raise AssertionError("should have raised")
+        except agents.ToolError as e:
+            assert "soldee" in str(e)
+
+        # paiement partiel -> jamais relance (prelevement automatique)
+        main._api_v2_get = lambda path, params, company_id: (dict(inv, remaining_amount_with_tax="300.00") if path == "/customer_invoices/5" else fake_get(path, params, company_id))
+        try:
+            send_pennylane_invoice_email(21994007, 5, 1, dry_run=True)
+            raise AssertionError("should have raised")
+        except agents.ToolError as e:
+            assert "paiement partiel" in str(e)
+        main._api_v2_get = fake_get
+
+        # scope customer_invoices:all absent -> envoi reel refuse, aucun POST
+        def fake_get_noscope(path, params, company_id):
+            if path == "/me":
+                return {"scopes": ["customers:readonly"]}
+            return fake_get(path, params, company_id)
+        main._api_v2_get = fake_get_noscope
+        posts.clear()
+        try:
+            send_pennylane_invoice_email(21994007, 5, 1, dry_run=False, journal_json="[]")
+            raise AssertionError("should have raised")
+        except agents.ToolError as e:
+            assert "customer_invoices:all" in str(e)
+        assert not posts
+        main._api_v2_get = fake_get
+
+        # HTTP 409 (PDF pas encore genere) -> ToolError avec indice de retry
+        main._api_v2_post = lambda path, params, company_id, body=None: (409, {"message": "pdf not generated"})
+        try:
+            send_pennylane_invoice_email(21994007, 5, 1, dry_run=False, journal_json="[]")
+            raise AssertionError("should have raised")
+        except agents.ToolError as e:
+            assert "409" in str(e)
+        main._api_v2_post = fake_post
+
+        # plafond quotidien atteint -> refuse
+        journal_full = json.dumps([
+            {"invoice_id": 1000 + i, "stage": 1, "channel": "pennylane_email", "at": f"{today.isoformat()}T08:00:00+01:00", "dry_run": False}
+            for i in range(main.DEFAULT_DAILY_SEND_CAP)
+        ])
+        posts.clear()
+        try:
+            send_pennylane_invoice_email(21994007, 5, 1, dry_run=False, journal_json=journal_full)
+            raise AssertionError("should have raised")
+        except agents.ToolError as e:
+            assert "Plafond" in str(e)
+        assert not posts
+
+        # modele du palier absent : dry-run -> warning (pas d'exception), envoi reel -> ToolError
+        def fake_get_no_tpl(path, params, company_id):
+            if path == "/billing_email_templates":
+                return {"items": [], "has_more": False}
+            return fake_get(path, params, company_id)
+        main._api_v2_get = fake_get_no_tpl
+        outw = send_pennylane_invoice_email(21994007, 5, 1, dry_run=True, journal_json="[]")
+        assert outw["dry_run"] is True and outw["template_id"] is None and "warning" in outw
+        try:
+            send_pennylane_invoice_email(21994007, 5, 1, dry_run=False, journal_json="[]")
+            raise AssertionError("should have raised")
+        except agents.ToolError as e:
+            assert "Modele d'email" in str(e)
+        main._api_v2_get = fake_get
+    finally:
+        main._api_v2_get, main._api_v2_post = orig_get, orig_post
+        del os.environ[main.API_TOKEN_ENV]
+    print("send_pennylane_invoice_email tests: OK")
+
+
+def test_fetch_invoice_pdf_base64() -> None:
+    os.environ[main.API_TOKEN_ENV] = "dummy-token-never-printed"
+    inv = {"id": 9, "invoice_number": "FA-9", "public_file_url": "https://app.pennylane.com/signed/abc"}
+    orig_get, orig_dl = main._api_v2_get, main._download_bytes
+    try:
+        main._api_v2_get = lambda path, params, company_id: (inv if path == "/customer_invoices/9" else (_ for _ in ()).throw(AssertionError(f"unexpected path {path}")))
+        main._download_bytes = lambda url, max_bytes: b"%PDF-1.4 fake"
+        out = fetch_invoice_pdf_base64(21994007, 9)
+        assert out["too_large"] is False and out["filename"] == "FA-9.pdf"
+        assert out["mime_type"] == "application/pdf" and out["size"] == len(b"%PDF-1.4 fake")
+        assert out["base64"] == base64.b64encode(b"%PDF-1.4 fake").decode("ascii")
+
+        main._download_bytes = lambda url, max_bytes: b"x" * (max_bytes + 1)
+        out2 = fetch_invoice_pdf_base64(21994007, 9)
+        assert out2["too_large"] is True and out2["size"] == 3_000_001 and "drive_link_hint" in out2
+
+        main._api_v2_get = lambda path, params, company_id: {"id": 9, "invoice_number": "FA-9"}
+        try:
+            fetch_invoice_pdf_base64(21994007, 9)
+            raise AssertionError("should have raised")
+        except agents.ToolError as e:
+            assert "public_file_url" in str(e)
+        try:
+            fetch_invoice_pdf_base64(0, 9)
+            raise AssertionError("should have raised")
+        except agents.ToolError as e:
+            assert "entier positif" in str(e)
+    finally:
+        main._api_v2_get, main._download_bytes = orig_get, orig_dl
+        del os.environ[main.API_TOKEN_ENV]
+    print("fetch_invoice_pdf_base64 tests: OK")
+
+
 if __name__ == "__main__":
     test_compute_report()
     test_compute_validation()
@@ -445,5 +728,8 @@ if __name__ == "__main__":
     test_top_debtors()
     test_fetch_top_debtors()
     test_fetch_email_templates()
+    test_fetch_relance_plan()
+    test_send_pennylane_invoice_email()
+    test_fetch_invoice_pdf_base64()
     asyncio.run(main_async())
     print("ALL LOCAL CHECKS PASSED")

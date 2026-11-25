@@ -1,18 +1,26 @@
-"""POC lecture seule : rapport a blanc du plan de relance des factures clients Pennylane.
+"""Agent de relance des factures clients Pennylane (v9, phase 2 en dry-run par defaut).
 
 L'agent lit les factures clients (dates d'emission, echeances, paiements, clients) :
-- via l'API Company v2 (outil fetch_pennylane_customer_invoices, token lu depuis la
-  variable d'environnement PENNYLANE_API_TOKEN injectee par le deploiement a partir du
-  secret workspace ; le token n'est jamais un argument ni affiche), quand le MCP
-  renvoie des 500 sur les endpoints factures ;
+- via l'API Company v2 (outils fetch_*, token lu depuis la variable d'environnement
+  PENNYLANE_API_TOKEN injectee par le deploiement a partir du secret workspace ; le
+  token n'est jamais un argument ni affiche), le MCP renvoyant des 500 sur les
+  endpoints factures pour cette entreprise ;
 - via le connecteur MCP Pennylane en secours (comptes 411, clients, paiements).
 Il applique les regles de relance (J = date d'echeance ; seuils J+15 / J+30 / J+45 /
 J+60 / J+90 ; exclusion de la 1re relance quand date d'emission = date d'echeance ;
 exclusion des factures en paiement partiel, encaissees par prelevement automatique) de
-facon deterministe via l'outil compute_relance_report, et produit un rapport markdown.
-Aucun envoi, aucune ecriture : le garde-fou bloque tout outil non autorise.
+facon deterministe via l'outil compute_relance_report.
+
+Phase 2 (v9) : plan du jour filtre par le journal Drive anti-doublon (fetch_relance_plan),
+envois e-mail Pennylane J+15/30/45 via POST send_by_email (send_pennylane_invoice_email,
+dry-run par defaut via RELANCE_DRY_RUN=true), brouillon Gmail avec PDF en PJ pour J+60
+(fetch_invoice_pdf_base64 + gmail_create_draft), lettre de mise en demeure stockee dans
+Drive pour J+90. Le garde-fou RelanceGuardrail n'autorise que : outils client.*, lectures
+Pennylane, gmail_create_draft (+ lectures Gmail), lectures/creations/mises a jour Drive.
+Aucun envoi Gmail automatique, aucune suppression, run_operations bloque.
 """
 
+import base64
 import json
 import os
 import time
@@ -48,6 +56,17 @@ PHASE2_CONFIG = {
         3: "Relance impayée j+45",
     },
 }
+
+# Phase 2 (v9) : securites par defaut
+RELANCE_DRY_RUN_ENV = "RELANCE_DRY_RUN"          # "true" par defaut : aucun envoi reel tant que non desactive explicitement
+RELANCE_DAILY_CAP_ENV = "RELANCE_DAILY_SEND_CAP"  # plafond d'envois e-mail Pennylane reels par jour
+DEFAULT_DAILY_SEND_CAP = 20
+PDF_MAX_BYTES = 3_000_000                         # limite PJ brouillon Gmail (~3 Mo)
+JOURNAL_FILENAME = "journal-relances.json"
+REPORTS_FOLDER = "rapports"
+LETTERS_FOLDER = "Mises en demeure"
+GMAIL_PREFIX = "connector_gmail."
+DRIVE_PREFIX = "connector_google_drive_mcp."
 
 # Outils curates officiels du MCP Pennylane (allow-list 100% lecture seule cote serveur) :
 # https://pennylane-mcp.readme.io/docs/getting-started
@@ -97,11 +116,6 @@ CURATED_READ_TOOLS = {
 # construction (allow-list serveur) : on l'autorise meme s'il n'est pas dans la liste
 # ci-dessus, pour rester robuste si Pennylane ajoute des outils curates.
 READ_PREFIXES = ("list_", "get_", "query_")
-
-WRITE_OP_HINTS = (
-    "send", "post", "create", "update", "delete", "mark", "finalize",
-    "import", "link", "letter", "upload", "put", "patch", "reminder",
-)
 
 STAGES = [
     {"threshold": 15, "level": 1, "label": "1re relance - simple rappel", "tone": "tres cordial", "channel": "email automatique Pennylane"},
@@ -396,8 +410,8 @@ def compute_encours_report(accounts_json: str, customers_json: str, payments_jso
     }
 
 
-def _api_v2_get(path: str, params: dict[str, Any], company_id: int) -> dict[str, Any]:
-    """GET sur l'API Company v2 Pennylane. Le token vient UNIQUEMENT de l'env."""
+def _api_v2_token() -> str:
+    """Token API lu UNIQUEMENT depuis l'environnement du worker (jamais un argument, jamais affiche)."""
     token = next(
         (os.environ[v].strip() for v in (API_TOKEN_ENV, API_TOKEN_ENV_FALLBACK) if os.environ.get(v, "").strip()),
         "",
@@ -407,25 +421,68 @@ def _api_v2_get(path: str, params: dict[str, Any], company_id: int) -> dict[str,
             f"Variable d'environnement {API_TOKEN_ENV} (ou {API_TOKEN_ENV_FALLBACK}) absente : "
             "le secret workspace (cle_api_pennylane) n'est pas injecte dans ce deploiement."
         )
+    return token
+
+
+def _api_v2_request(method: str, path: str, params: dict[str, Any], company_id: int, body: dict[str, Any] | None = None) -> tuple[int, Any]:
+    """Requete brute API v2. Retourne (status HTTP, payload JSON ou texte tronque).
+
+    Ne leve ToolError que sur erreur reseau (URLError) ; les HTTP 4xx/5xx sont
+    retournes au caller (status, payload) pour qu'il decide (ex. 409 = retry).
+    """
+    token = _api_v2_token()
     query = urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")})
     url = f"{PENNYLANE_API_BASE}{path}" + (f"?{query}" if query else "")
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "X-Company-Id": str(company_id),
-        },
-        method="GET",
-    )
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "X-Company-Id": str(company_id),
+    }
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+            status = resp.status
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")[:300]
-        raise agents.ToolError(f"API Pennylane v2 {path} -> HTTP {e.code}: {body}")
+        raw = e.read().decode("utf-8", "replace")
+        status = e.code
     except urllib.error.URLError as e:
         raise agents.ToolError(f"API Pennylane v2 {path} injoignable: {e.reason}")
+    try:
+        payload = json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        payload = raw[:2000]
+    return status, payload
+
+
+def _api_v2_get(path: str, params: dict[str, Any], company_id: int) -> dict[str, Any]:
+    """GET sur l'API Company v2 Pennylane. Le token vient UNIQUEMENT de l'env.
+
+    Leve ToolError sur HTTP >= 400 (message avec status + extrait de body, jamais de token).
+    """
+    status, payload = _api_v2_request("GET", path, params, company_id)
+    if status >= 400:
+        body = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)[:300]
+        raise agents.ToolError(f"API Pennylane v2 {path} -> HTTP {status}: {body}")
+    if not isinstance(payload, dict):
+        raise agents.ToolError(f"API Pennylane v2 {path} -> reponse inattendue (HTTP {status})")
+    return payload
+
+
+def _api_v2_post(path: str, params: dict[str, Any], company_id: int, body: dict[str, Any] | None = None) -> tuple[int, Any]:
+    """POST sur l'API Company v2 Pennylane. Retourne (status, payload) SANS lever sur 4xx/5xx."""
+    return _api_v2_request("POST", path, params, company_id, body)
+
+
+def _download_bytes(url: str, max_bytes: int) -> bytes:
+    """Telecharge une URL (ex. public_file_url signe) en lisant au plus max_bytes + 1 octets."""
+    req = urllib.request.Request(url, headers={"Accept": "application/pdf"}, method="GET")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read(max_bytes + 1)
 
 
 SKIP_STATUSES = {"draft", "credit_note", "cancelled", "partially_cancelled", "archived"}
@@ -462,6 +519,113 @@ def _map_v2_invoice(item: dict[str, Any], cust_by_id: dict[int, dict[str, Any]])
     }
 
 
+def _fetch_v2_customers(company_id: int, max_pages: int = 20) -> dict[int, dict[str, Any]]:
+    """GET /customers pagine (cursor) -> {id: client}."""
+    cust_by_id: dict[int, dict[str, Any]] = {}
+    cursor = None
+    for _ in range(max_pages):
+        data = _api_v2_get("/customers", {"limit": 100, "cursor": cursor}, company_id)
+        for c in data.get("items", []):
+            if c.get("id") is not None:
+                cust_by_id[c["id"]] = c
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+        time.sleep(0.3)
+    return cust_by_id
+
+
+def _fetch_v2_invoices(company_id: int, cust_by_id: dict[int, dict[str, Any]], max_pages: int = 40) -> tuple[list[dict[str, Any]], int, int]:
+    """GET /customer_invoices pagine (draft=false, credit_note=false) -> (factures mappees, pages, nb vus)."""
+    invoices: list[dict[str, Any]] = []
+    seen = 0
+    pages = 0
+    cursor = None
+    flt = json.dumps([
+        {"field": "draft", "operator": "eq", "value": "false"},
+        {"field": "credit_note", "operator": "eq", "value": "false"},
+    ])
+    while pages < max_pages:
+        data = _api_v2_get("/customer_invoices", {"limit": 100, "cursor": cursor, "filter": flt, "sort": "-id"}, company_id)
+        pages += 1
+        for item in data.get("items", []):
+            seen += 1
+            mapped = _map_v2_invoice(item, cust_by_id)
+            if mapped is not None:
+                invoices.append(mapped)
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+        time.sleep(0.3)
+    return invoices, pages, seen
+
+
+def _dry_run_default() -> bool:
+    return os.environ.get(RELANCE_DRY_RUN_ENV, "true").strip().lower() not in ("0", "false", "no", "")
+
+
+def _daily_send_cap() -> int:
+    try:
+        return max(1, int(os.environ.get(RELANCE_DAILY_CAP_ENV, str(DEFAULT_DAILY_SEND_CAP)).strip()))
+    except ValueError:
+        return DEFAULT_DAILY_SEND_CAP
+
+
+def _parse_journal(journal_json: str) -> list[dict[str, Any]]:
+    try:
+        journal = json.loads(journal_json or "[]")
+    except json.JSONDecodeError as e:
+        raise agents.ToolError(f"journal_json invalide (liste JSON attendue) : {e}")
+    if not isinstance(journal, list):
+        raise agents.ToolError("journal_json doit etre une liste JSON d'entrees {invoice_id, stage, channel, at, dry_run}.")
+    return journal
+
+
+def _journal_has(journal: list[dict[str, Any]], invoice_id: Any, stage: int) -> bool:
+    """True si (invoice_id, stage) a deja ete relance REELLEMENT (les entrees dry_run ne bloquent pas)."""
+    return any(
+        e.get("invoice_id") == invoice_id and e.get("stage") == stage and not e.get("dry_run")
+        for e in journal
+    )
+
+
+def _journal_today_email_sends(journal: list[dict[str, Any]], today: str) -> int:
+    return sum(
+        1
+        for e in journal
+        if e.get("channel") == "pennylane_email" and not e.get("dry_run") and str(e.get("at", ""))[:10] == today
+    )
+
+
+def _stage_for(deadline: date | None, issue: date | None, run_date: date) -> tuple[dict[str, Any] | None, int]:
+    """Palier applicable a une facture a run_date (memes regles que compute_relance_report)."""
+    if deadline is None:
+        return None, -1
+    days_late = (run_date - deadline).days
+    if days_late < 0:
+        return None, days_late
+    stage = None
+    for s in STAGES:
+        if days_late >= s["threshold"]:
+            stage = s
+    if stage is None:
+        return None, days_late
+    if stage["level"] == 1 and issue is not None and issue == deadline:
+        return None, days_late
+    return stage, days_late
+
+
+def _resolve_template_id(company_id: int, stage: int) -> dict[str, Any] | None:
+    """Resout le modele d'email Pennylane du palier (nom depuis PHASE2_CONFIG) via GET /billing_email_templates."""
+    wanted = _norm_key(PHASE2_CONFIG["relance_email_templates"][stage])
+    data = _api_v2_get("/billing_email_templates", {"limit": 100}, company_id)
+    for it in data.get("items", []):
+        blob = _norm_key(" ".join(str(v) for v in it.values() if isinstance(v, str)))
+        if wanted in blob:
+            return it
+    return None
+
+
 @agents.tool
 def fetch_pennylane_customer_invoices(company_id: int, max_pages: int = 40) -> dict[str, Any]:
     """Lit les factures clients Pennylane via l'API Company v2 (lecture seule, GET uniquement).
@@ -485,41 +649,11 @@ def fetch_pennylane_customer_invoices(company_id: int, max_pages: int = 40) -> d
     if not isinstance(company_id, int) or company_id <= 0:
         raise agents.ToolError("company_id doit etre un entier positif (ex. 21994007).")
 
-    cust_by_id: dict[int, dict[str, Any]] = {}
     try:
-        cursor = None
-        for _ in range(20):
-            params = {"limit": 100, "cursor": cursor}
-            data = _api_v2_get("/customers", params, company_id)
-            for c in data.get("items", []):
-                if c.get("id") is not None:
-                    cust_by_id[c["id"]] = c
-            if not data.get("has_more"):
-                break
-            cursor = data.get("next_cursor")
-            time.sleep(0.3)
+        cust_by_id = _fetch_v2_customers(company_id)
     except agents.ToolError:
         cust_by_id = {}
-
-    invoices: list[dict[str, Any]] = []
-    cursor = None
-    pages = 0
-    flt = json.dumps([
-        {"field": "draft", "operator": "eq", "value": "false"},
-        {"field": "credit_note", "operator": "eq", "value": "false"},
-    ])
-    while pages < max_pages:
-        params = {"limit": 100, "cursor": cursor, "filter": flt, "sort": "-id"}
-        data = _api_v2_get("/customer_invoices", params, company_id)
-        pages += 1
-        for item in data.get("items", []):
-            mapped = _map_v2_invoice(item, cust_by_id)
-            if mapped is not None:
-                invoices.append(mapped)
-        if not data.get("has_more"):
-            break
-        cursor = data.get("next_cursor")
-        time.sleep(0.3)
+    invoices, pages, _seen = _fetch_v2_invoices(company_id, cust_by_id, max_pages)
 
     return {
         "company_id": company_id,
@@ -932,41 +1066,328 @@ def fetch_pennylane_email_templates(company_id: int, max_pages: int = 10) -> dic
     }
 
 
-class ReadOnlyPennylaneGuardrail(agents.Hook):
-    """N'autorise que les outils Pennylane curates en lecture seule et les outils client.*.
+@agents.tool
+def fetch_relance_plan(company_id: int, today: str | None = None, journal_json: str = "[]", max_pages: int = 40) -> dict[str, Any]:
+    """Plan de relance DU JOUR, calcule entierement cote serveur (API v2, GET uniquement) et filtre via le journal Drive.
 
-    Autorise tout outil Pennylane nomme list_*, get_* ou query_* (allow-list lecture seule
-    cote serveur) plus search_operations ; run_operations n'est autorise que si son
-    operation_id ne ressemble pas a une ecriture. Bloque tout le reste (run_typescript,
-    autres connecteurs, outils inconnus) : le POC est 100% lecture seule, aucun envoi ni
-    aucune modification n'est possible.
+    company_id : identifiant Pennylane (ex. 21994007). today : date du jour YYYY-MM-DD (vide = aujourd'hui).
+    journal_json : contenu actuel du journal Drive (liste JSON d'entrees {invoice_id, stage, channel, at,
+        dry_run}) : toute facture dont le couple (invoice_id, stage) y figure deja (hors entrees dry_run)
+        est exclue du plan. max_pages : securite pagination factures (defaut 40 pages de 100).
+
+    Appels effectues (GET uniquement ; token lu dans l'environnement du worker, jamais argument ni affiche) :
+    GET /me (verification best effort du scope customer_invoices:all), GET /customers, GET /customer_invoices
+    pagine par cursor. Le plan est calcule par compute_relance_report (memes regles metier deterministes :
+    J = echeance, paliers J+15/30/45/60/90, exclusion 1re relance si emission = echeance, paiement partiel
+    hors relances).
+
+    Retourne : today, source, scopes_ok, invoices_seen, pages_fetched, by_stage, total_due, plan (factures
+    a traiter, chacune avec action : "pennylane_email" niveaux 1-3, "gmail_draft" niveau 4 J+60,
+    "drive_letter" niveau 5 J+90), excluded_by_journal et report_markdown. Aucune ecriture, aucun envoi.
+    """
+    if not isinstance(company_id, int) or company_id <= 0:
+        raise agents.ToolError("company_id doit etre un entier positif (ex. 21994007).")
+    if today:
+        run_date = _parse_date(today)
+        if run_date is None:
+            raise agents.ToolError("today doit etre au format YYYY-MM-DD.")
+    else:
+        run_date = agents.now().date()
+    journal = _parse_journal(journal_json)
+    if not isinstance(max_pages, int) or max_pages <= 0:
+        raise agents.ToolError("max_pages doit etre un entier positif.")
+
+    scopes_ok = None
+    try:
+        me_blob = json.dumps(_api_v2_get("/me", {}, company_id), ensure_ascii=False)
+        scopes_ok = "customer_invoices:all" in me_blob
+    except agents.ToolError:
+        scopes_ok = None
+
+    try:
+        cust_by_id = _fetch_v2_customers(company_id)
+    except agents.ToolError:
+        cust_by_id = {}
+    invoices, pages, seen = _fetch_v2_invoices(company_id, cust_by_id, max_pages)
+
+    report = compute_relance_report(json.dumps(invoices, ensure_ascii=False), today=run_date.isoformat())
+    action_by_level = {1: "pennylane_email", 2: "pennylane_email", 3: "pennylane_email", 4: "gmail_draft", 5: "drive_letter"}
+    plan: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    for e in report["items"]:
+        level = e["stage"]["level"]
+        if _journal_has(journal, e["invoice_id"], level):
+            excluded.append({"invoice_id": e["invoice_id"], "number": e["number"], "customer_name": e["customer_name"], "stage": level})
+            continue
+        e["action"] = action_by_level[level]
+        plan.append(e)
+    plan.sort(key=lambda e: (-e["stage"]["level"], -e["days_late"]))
+    by_stage: dict[str, int] = {}
+    for e in plan:
+        by_stage[str(e["stage"]["level"])] = by_stage.get(str(e["stage"]["level"]), 0) + 1
+    total_due = round(sum(e["amount_due"] for e in plan), 2)
+    currency = plan[0]["currency"] if plan else "EUR"
+
+    lines = [
+        f"# Plan de relance du {run_date.isoformat()} - company_id {company_id} (API v2, {seen} factures lues, {pages} pages)",
+        "",
+        f"- Scope customer_invoices:all (GET /me) : {'OK' if scopes_ok else ('INDISPONIBLE' if scopes_ok is None else 'ABSENT (les envois reels seront refuses)')}",
+        f"- Factures en retard avec action prevue : **{len(plan)}** (reste du **{total_due:.2f} {currency}**)",
+        f"- Deja relancees selon le journal (exclues du plan) : {len(excluded)}",
+        f"- Par palier : {json.dumps(by_stage, ensure_ascii=False)}",
+        "",
+    ]
+    if plan:
+        lines += [
+            "| Facture | Client | Email | Reste du | Echeance (J) | Retard (j) | Palier | Action |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        for e in plan:
+            s = e["stage"]
+            lines.append(
+                f"| {e['number'] or e['invoice_id']} | {e['customer_name']} | {e['customer_email'] or ''} | "
+                f"{e['amount_due']:.2f} {e['currency']} | {e['deadline']} | {e['days_late']} | "
+                f"{s['level']} ({s['label']}) | {e['action']} |"
+            )
+        lines.append("")
+    if excluded:
+        lines += ["## Exclues (deja dans le journal)", ""]
+        for x in excluded:
+            lines.append(f"- {x['number'] or x['invoice_id']} ({x['customer_name']}) - palier {x['stage']}")
+        lines.append("")
+
+    return {
+        "today": run_date.isoformat(),
+        "company_id": company_id,
+        "source": "pennylane_api_v2",
+        "scopes_ok": scopes_ok,
+        "invoices_seen": seen,
+        "pages_fetched": pages,
+        "by_stage": by_stage,
+        "total_due": total_due,
+        "currency": currency,
+        "plan": plan,
+        "excluded_by_journal": excluded,
+        "report_markdown": "\n".join(lines),
+    }
+
+
+@agents.tool
+def send_pennylane_invoice_email(company_id: int, invoice_id: int, stage: int, dry_run: bool | None = None, journal_json: str = "[]") -> dict[str, Any]:
+    """Envoie la relance e-mail Pennylane d'une facture (POST /customer_invoices/{id}/send_by_email) ou la simule en dry-run.
+
+    company_id : identifiant Pennylane. invoice_id : id interne API v2 de la facture. stage : palier 1 (J+15),
+        2 (J+30) ou 3 (J+45) uniquement (J+60 = brouillon Gmail, J+90 = lettre Drive). dry_run : true = aucun
+        POST effectue (defaut = env RELANCE_DRY_RUN, "true" par securite) ; false = envoi reel. journal_json :
+        journal Drive actuel (anti-doublon + plafond quotidien).
+
+    Validations cote serveur avant tout envoi : facture existante et non soldee, sans paiement partiel
+    (prelevement automatique), echeance passee, palier recalcule == stage demande (J = echeance ; exclusion
+    1re relance si emission = echeance), couple (invoice_id, stage) absent du journal, scope
+    customer_invoices:all verifie via GET /me (envoi reel uniquement), plafond quotidien RELANCE_DAILY_SEND_CAP
+    (defaut 20, envoi reel uniquement), modele d'email du palier retrouve par son nom dans
+    GET /billing_email_templates. Envoi : POST /customer_invoices/{id}/send_by_email avec
+    {"email_template_id": id} (recipients laisse vide = e-mails du client dans Pennylane).
+    204 = e-mail en file d'envoi ; 409 = PDF pas encore genere (reessayer dans quelques minutes).
+
+    Retourne : sent, dry_run, status_http, template_id, invoice_id, stage, customer_email, journal_entry
+    (a ajouter au journal) et journal_json (journal mis a jour, pret a etre reecrit dans Drive).
+    Le token n'est jamais un argument ni affiche.
+    """
+    if not isinstance(company_id, int) or company_id <= 0:
+        raise agents.ToolError("company_id doit etre un entier positif (ex. 21994007).")
+    if not isinstance(invoice_id, int) or invoice_id <= 0:
+        raise agents.ToolError("invoice_id doit etre un entier positif (id interne API v2 de la facture).")
+    if stage not in (1, 2, 3):
+        raise agents.ToolError("stage doit etre 1 (J+15), 2 (J+30) ou 3 (J+45). J+60 = brouillon Gmail, J+90 = lettre Drive.")
+    dry = _dry_run_default() if dry_run is None else bool(dry_run)
+    journal = _parse_journal(journal_json)
+    today = agents.now().date()
+
+    if _journal_has(journal, invoice_id, stage):
+        raise agents.ToolError(f"Facture {invoice_id} palier {stage} : deja relancee selon le journal (anti-doublon).")
+
+    inv = _api_v2_get(f"/customer_invoices/{invoice_id}", {}, company_id)
+    status = inv.get("status") or ""
+    if status in SKIP_STATUSES or inv.get("draft") or inv.get("credit_note"):
+        raise agents.ToolError(f"Facture {invoice_id} : statut {status or 'inconnu'} non relancable (brouillon/avoir/annulee).")
+    amount = _to_float(inv.get("currency_amount") or inv.get("amount"))
+    remaining = inv.get("remaining_amount_with_tax")
+    amount_paid = amount if inv.get("paid") else (round(amount - _to_float(remaining), 2) if remaining is not None else 0.0)
+    amount_due = round(amount - amount_paid, 2)
+    if amount_due <= 0.005:
+        raise agents.ToolError(f"Facture {invoice_id} deja soldee (reste du {amount_due:.2f}) : aucune relance.")
+    if amount_paid > 0.005:
+        raise agents.ToolError(
+            f"Facture {invoice_id} en paiement partiel ({amount_paid:.2f} paye, {amount_due:.2f} du) : "
+            "jamais relancee, le solde est encaisse par prelevement automatique."
+        )
+    issue = _parse_date(inv.get("date"))
+    deadline = _parse_date(inv.get("deadline"))
+    stage_calc, days_late = _stage_for(deadline, issue, today)
+    if stage_calc is None:
+        if deadline is None:
+            reason = "pas de date d'echeance"
+        elif days_late < 0:
+            reason = f"non echue (echeance {deadline.isoformat()})"
+        elif issue is not None and issue == deadline:
+            reason = "exclusion 1re relance : date d'emission = date d'echeance"
+        else:
+            reason = f"hors fenetre de relance ({days_late} j de retard)"
+        raise agents.ToolError(f"Facture {invoice_id} : aucun palier applicable aujourd'hui ({reason}).")
+    if stage_calc["level"] != stage:
+        raise agents.ToolError(f"Facture {invoice_id} : palier attendu {stage_calc['level']} ({days_late} j de retard), pas {stage}.")
+    customer = inv.get("customer") or {}
+    customer_email = None
+    if isinstance(customer.get("emails"), list) and customer["emails"]:
+        customer_email = customer["emails"][0]
+    elif customer.get("email"):
+        customer_email = customer["email"]
+
+    template = _resolve_template_id(company_id, stage)
+    if template is None:
+        msg = (
+            f"Modele d'email du palier {stage} (\"{PHASE2_CONFIG['relance_email_templates'][stage]}\") absent de "
+            "GET /billing_email_templates : a creer dans l'UI Pennylane avant tout envoi reel."
+        )
+        if dry:
+            return {"sent": False, "dry_run": True, "invoice_id": invoice_id, "stage": stage, "template_id": None,
+                    "customer_email": customer_email, "warning": msg, "journal_entry": None, "journal_json": journal_json}
+        raise agents.ToolError(msg)
+
+    if dry:
+        entry = {"invoice_id": invoice_id, "stage": stage, "channel": "pennylane_email", "template_id": template.get("id"),
+                 "at": agents.now().isoformat(), "dry_run": True}
+        return {"sent": False, "dry_run": True, "status_http": None, "template_id": template.get("id"),
+                "invoice_id": invoice_id, "stage": stage, "customer_email": customer_email,
+                "journal_entry": entry, "journal_json": json.dumps(journal + [entry], ensure_ascii=False)}
+
+    me_blob = json.dumps(_api_v2_get("/me", {}, company_id), ensure_ascii=False)
+    if "customer_invoices:all" not in me_blob:
+        raise agents.ToolError(
+            "Scope customer_invoices:all ABSENT du token (GET /me) : envoi reel refuse. Regenerer la cle API "
+            "Pennylane avec ce scope et mettre a jour le secret workspace cle_api_pennylane."
+        )
+    cap = _daily_send_cap()
+    if _journal_today_email_sends(journal, today.isoformat()) >= cap:
+        raise agents.ToolError(f"Plafond quotidien atteint ({cap} envois/jour, env {RELANCE_DAILY_CAP_ENV}) : aucune relance supplementaire aujourd'hui.")
+
+    status_http, payload = _api_v2_post(
+        f"/customer_invoices/{invoice_id}/send_by_email", {}, company_id,
+        {"email_template_id": template.get("id")},
+    )
+    if status_http == 409:
+        raise agents.ToolError(f"Facture {invoice_id} : HTTP 409, PDF pas encore genere cote Pennylane -> reessayer dans quelques minutes.")
+    if status_http >= 400:
+        body = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)[:300]
+        raise agents.ToolError(f"send_by_email facture {invoice_id} -> HTTP {status_http}: {body}")
+    entry = {"invoice_id": invoice_id, "stage": stage, "channel": "pennylane_email", "template_id": template.get("id"),
+             "at": agents.now().isoformat(), "dry_run": False}
+    return {"sent": status_http in (200, 202, 204), "dry_run": False, "status_http": status_http,
+            "template_id": template.get("id"), "invoice_id": invoice_id, "stage": stage,
+            "customer_email": customer_email, "journal_entry": entry,
+            "journal_json": json.dumps(journal + [entry], ensure_ascii=False)}
+
+
+@agents.tool
+def fetch_invoice_pdf_base64(company_id: int, invoice_id: int, max_bytes: int = PDF_MAX_BYTES) -> dict[str, Any]:
+    """Telecharge le PDF d'une facture Pennylane (via public_file_url, lien signe a courte validite) pour la PJ du brouillon Gmail J+60.
+
+    company_id : identifiant Pennylane. invoice_id : id interne API v2 de la facture. max_bytes : taille max
+        acceptee (defaut 3 000 000, limite PJ d'un brouillon Gmail).
+    Retourne {too_large: false, filename, mime_type: "application/pdf", size, base64} si size <= max_bytes,
+    sinon {too_large: true, size, max_bytes, filename, drive_link_hint} (deposer le PDF dans le dossier Drive
+    et mettre son lien dans le corps du brouillon). Lecture seule ; le token reste dans l'env du worker.
+    """
+    if not isinstance(company_id, int) or company_id <= 0:
+        raise agents.ToolError("company_id doit etre un entier positif (ex. 21994007).")
+    if not isinstance(invoice_id, int) or invoice_id <= 0:
+        raise agents.ToolError("invoice_id doit etre un entier positif (id interne API v2 de la facture).")
+    if not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise agents.ToolError("max_bytes doit etre un entier positif.")
+    inv = _api_v2_get(f"/customer_invoices/{invoice_id}", {}, company_id)
+    url = inv.get("public_file_url")
+    if not url:
+        raise agents.ToolError(f"Facture {invoice_id} : aucun public_file_url (PDF probablement pas encore genere).")
+    data = _download_bytes(url, max_bytes)
+    number = inv.get("invoice_number") or inv.get("label") or str(invoice_id)
+    if len(data) > max_bytes:
+        return {
+            "too_large": True,
+            "size": len(data),
+            "max_bytes": max_bytes,
+            "filename": f"{number}.pdf",
+            "drive_link_hint": "PDF trop gros pour une PJ Gmail : deposer le PDF dans le dossier Drive Relance-factures et mettre son lien dans le corps du brouillon.",
+        }
+    return {
+        "too_large": False,
+        "filename": f"{number}.pdf",
+        "mime_type": "application/pdf",
+        "size": len(data),
+        "base64": base64.b64encode(data).decode("ascii"),
+    }
+
+
+GMAIL_ALLOWED = {"gmail_create_draft", "create_draft", "gmail_search_threads", "search_threads", "gmail_get_thread", "get_thread"}
+GMAIL_DENY_HINTS = ("send", "delete")
+DRIVE_ALLOWED = {
+    "google_drive_mcp_search_files", "search_files",
+    "google_drive_mcp_read_file_content", "read_file_content",
+    "google_drive_mcp_download_file_content", "download_file_content",
+    "google_drive_mcp_list_recent_files", "list_recent_files",
+    "google_drive_mcp_get_file_metadata", "get_file_metadata",
+    "google_drive_mcp_create_file", "create_file",
+    "google_drive_mcp_update_file", "update_file",
+    "google_drive_mcp_copy_file", "copy_file",
+}
+DRIVE_DENY_HINTS = ("delete", "trash", "permission", "share", "move", "empty")
+
+
+class RelanceGuardrail(agents.Hook):
+    """Phase 2 (v9) : n'autorise que client.*, les lectures Pennylane, gmail_create_draft (+ lectures Gmail) et les lectures/creations/mises a jour Drive.
+
+    Bloque : run_operations (remplace par les outils client.* qui appellent l'API v2 directement), tout
+    envoi Gmail (gmail_send_email, gmail_send_draft), les suppressions/labels Gmail, les suppressions et
+    la gestion des permissions Drive, run_typescript et tout autre connecteur ou outil inconnu.
     """
 
     async def pre_tool_call(self, ctx, call):
-        if call.tool_id.startswith("client."):
+        tool_id = call.tool_id or ""
+        name = call.tool_name or ""
+        candidates = {name, tool_id, tool_id.split(".")[-1]}
+        if tool_id.startswith("client."):
             return None
-        if call.tool_id.startswith(PENNYLANE_PREFIX):
-            name = call.tool_name
+        if tool_id.startswith(PENNYLANE_PREFIX):
             if name in CURATED_READ_TOOLS or name.startswith(READ_PREFIXES):
                 if name == "run_operations":
-                    args = call.arguments or {}
-                    op = str(args.get("operation_id", ""))
-                    if any(h in op.lower() for h in WRITE_OP_HINTS):
-                        return agents.skip(
-                            f"Operation '{op}' bloquee : ce POC est en lecture seule, "
-                            "aucune operation d'ecriture (envoi, creation, modification) n'est autorisee."
-                        )
+                    return agents.skip(
+                        "run_operations est bloque en phase 2 : utiliser les outils client.* (fetch_relance_plan, "
+                        "send_pennylane_invoice_email, fetch_invoice_pdf_base64) qui appellent l'API v2 directement."
+                    )
                 return None
             return agents.skip(
-                f"L'outil Pennylane '{name}' n'est pas autorise dans ce POC (lecture seule). "
-                "Utilise les outils curates en lecture seule (list_*, get_*, query_*, "
-                "search_operations) : list_customer_invoices, get_customer_invoice, "
-                "list_customer_payments, list_customers, get_customer, get_company..."
+                f"L'outil Pennylane '{name}' n'est pas autorise. Utilise les lectures list_*/get_*/query_* "
+                "ou les outils client.*."
+            )
+        if tool_id.startswith(GMAIL_PREFIX):
+            if (candidates & GMAIL_ALLOWED) and not any(h in name.lower() for h in GMAIL_DENY_HINTS):
+                return None
+            return agents.skip(
+                f"Outil Gmail '{name}' bloque : seul gmail_create_draft (plus lectures search/get) est autorise. "
+                "Aucun envoi Gmail automatique (gmail_send_email / gmail_send_draft bloques)."
+            )
+        if tool_id.startswith(DRIVE_PREFIX):
+            if any(h in name.lower() for h in DRIVE_DENY_HINTS):
+                return agents.skip(f"Outil Drive '{name}' bloque : suppressions et gestion des permissions interdites.")
+            if candidates & DRIVE_ALLOWED:
+                return None
+            return agents.skip(
+                f"Outil Drive '{name}' non autorise : lectures, create_file, update_file et copy_file uniquement "
+                f"(journal {JOURNAL_FILENAME}, rapports, lettres de mise en demeure)."
             )
         return agents.skip(
-            f"L'outil '{call.tool_name}' n'est pas autorise : cet agent POC n'utilise que le "
-            "connecteur Pennylane en lecture seule et son outil de calcul de rapport. "
-            "Aucun envoi ni aucune ecriture n'est possible."
+            f"L'outil '{name}' n'est pas autorise : cet agent n'utilise que les outils client.*, le connecteur "
+            "Pennylane en lecture seule, gmail_create_draft et le connecteur Drive (lecture/creation/mise a jour)."
         )
 
 
@@ -1033,16 +1454,51 @@ REGLES METIER (appliquees par l'outil compute_relance_report) :
 
 ERREURS : si un outil renvoie une erreur, lis le message et explique clairement le
 probleme. Ne devine jamais un montant ni une date. Ne jamais afficher de token/cles.
+
+PROTOCOLE PHASE 2 (v9) - RUN QUOTIDIEN (dry-run par defaut, aucun envoi reel tant que
+RELANCE_DRY_RUN n'est pas mis a "false" et que les prerequis ne sont pas remplis) :
+1. company_id : prends-le dans le message de l'utilisateur (ex. "company_id: 21994007").
+2. JOURNAL DRIVE (source de verite anti-doublon) : google_drive_mcp_search_files pour trouver
+   "journal-relances.json" dans le dossier "Relance-factures" (id 1D3gWJnITWIpHHUKo13jgBClAmzWInDqP), puis
+   google_drive_mcp_read_file_content -> journal_json. Si le fichier n'existe pas, journal_json = "[]".
+3. PLAN : fetch_relance_plan(company_id=<id>, today=<YYYY-MM-DD>, journal_json=<journal_json>) -> plan
+   (chaque item a une action : "pennylane_email" | "gmail_draft" | "drive_letter") + report_markdown.
+4. Niveaux 1-3 (action "pennylane_email") : pour chaque item, send_pennylane_invoice_email(
+   company_id=<id>, invoice_id=<item.invoice_id>, stage=<niveau 1/2/3>, dry_run=<dry_run demande>,
+   journal_json=<journal courant>). Si le resultat contient journal_json mis a jour, REMPLACE le journal
+   courant par cette valeur (l'outil a verifie anti-doublon, palier, scope, plafond, modele).
+5. Niveau 4 J+60 (action "gmail_draft") : fetch_invoice_pdf_base64(company_id, invoice_id) puis
+   gmail_create_draft(to=<customer_email>, subject="Facture <number> en attente de reglement - 4e rappel",
+   body=..., attachments=[{filename, mimeType: "application/pdf", content: <base64>}] si too_large=false,
+   sinon lien Drive dans le corps). JAMAIS gmail_send_email / gmail_send_draft : brouillon uniquement,
+   envoi manuel apres revue. Ajoute au journal une entree {invoice_id, stage: 4, channel: "gmail_draft", at, dry_run}.
+6. Niveau 5 J+90 (action "drive_letter") : redige la lettre de mise en demeure en markdown (emetteur
+   ID Interactive SAS, SIRET 490491594, Arradon ; facture, montant, echeance, penalites de retard CGVS
+   art. 8 : 3x taux legal + 40 EUR) puis google_drive_mcp_create_file(title="Mise en demeure - <client> -
+   <facture> - <date>.md", parent_id=<dossier Relance-factures ou sous-dossier "Mises en demeure">,
+   text_content=<lettre>, content_mime_type="text/markdown", disable_conversion_to_google_type=true).
+   Envoi postal LRAR MANUEL : la lettre n'est jamais envoyee automatiquement. Journal : channel "drive_letter".
+7. PERSISTE le journal final : google_drive_mcp_update_file sur le fichier journal (ou create_file s'il
+   n'existait pas) avec le journal_json final. Puis ecris le rapport du jour :
+   google_drive_mcp_create_file("rapport-<YYYY-MM-DD>.md" dans le sous-dossier "rapports", text_content=
+   report_markdown + resume des actions).
+8. Reponse finale = resume markdown : nb actions par palier, envois (ou simulations dry-run), brouillons
+   crees, lettres redigees, lien vers le rapport Drive.
+
+SECURITES (garde-fou RelanceGuardrail) : ne JAMAIS appeler gmail_send_email, gmail_send_draft,
+run_operations, ni aucun outil de suppression/permission Drive - ils sont bloques. dry_run=true par defaut :
+les envois Pennylane reels exigent dry_run=false explicite + scope customer_invoices:all + les 3 modeles
+d'email j+15/j+30/j+45 dans Pennylane + plafond RELANCE_DAILY_SEND_CAP (defaut 20/jour).
 """
 
 agent = agents.Agent(
     model="mistral-large-4",
     name="relance-factures-poc",
-    description="POC lecture seule : lit les factures clients impayees dans Pennylane (connexion de l'utilisateur) et produit un rapport a blanc du plan de relance J+15/30/45/60/90. Aucun envoi.",
+    description="Agent de relance des factures clients impayees Pennylane : plan deterministe J+15/30/45/60/90, envois e-mail Pennylane (dry-run par defaut), brouillon Gmail avec PDF pour J+60, lettre de mise en demeure dans Drive pour J+90, journal Drive anti-doublon.",
     instructions=INSTRUCTIONS,
-    tools=[compute_relance_report, compute_encours_report, fetch_pennylane_customer_invoices, top_debtors_report, fetch_top_debtors, fetch_pennylane_email_templates],
-    connectors=[agents.connector("pennylane_e376")],
+    tools=[compute_relance_report, compute_encours_report, fetch_pennylane_customer_invoices, top_debtors_report, fetch_top_debtors, fetch_pennylane_email_templates, fetch_relance_plan, send_pennylane_invoice_email, fetch_invoice_pdf_base64],
+    connectors=[agents.connector("pennylane_e376"), agents.connector("gmail"), agents.connector("google_drive_mcp")],
     builtins=agents.Builtins(skills=False, subagents=False),
-    guardrails=[ReadOnlyPennylaneGuardrail()],
+    guardrails=[RelanceGuardrail()],
     max_iterations=60,
 )

@@ -166,3 +166,30 @@ run dry-run de bout en bout sur le déploiement.
 3. Quel compte Gmail pour les brouillons J+60, et quel dossier Drive pour le journal et les
    lettres ?
 4. Politique e-invoicing (R2) et plafond d'envois par jour en phase réelle ?
+
+## 9. Addendum 2026-11-25 — v9 implémentée sur la branche `vibe/relance-factures-poc-226b64`
+
+L'architecture de la section 4 est codée dans `main.py` (l'agent garde le nom/déploiement
+`relance-factures-poc`) :
+
+- **3 outils serveur `client.*`** : `fetch_relance_plan` (plan du jour filtré par le journal,
+  scope vérifié via `GET /me`), `send_pennylane_invoice_email` (validations serveur complètes :
+  anti-doublon journal, palier recalculé, facture non soldée / sans paiement partiel, scope
+  `customer_invoices:all`, plafond quotidien, modèle résolu par nom ; POST `send_by_email`,
+  409 = retry ; retourne l'entrée de journal + journal mis à jour), `fetch_invoice_pdf_base64`
+  (PDF via `public_file_url`, base64 ≤ 3 Mo sinon `drive_link_hint`).
+- **Garde-fou v2 `RelanceGuardrail`** : `client.*` + lectures Pennylane + `gmail_create_draft`
+  (+ lectures Gmail) + lectures/create/update/copy Drive ; bloque `run_operations`, tout envoi
+  Gmail, les suppressions/permissions, `run_typescript` et les autres connecteurs.
+- **Sécurités par défaut** : `RELANCE_DRY_RUN=true` (aucun envoi réel tant que non désactivé),
+  `RELANCE_DAILY_SEND_CAP=20`. Journal Drive `journal-relances.json` (clé `invoice_id` + palier ;
+  les entrées `dry_run: true` ne bloquent pas les envois réels).
+- **Connecteurs ajoutés à l'agent** : `pennylane_e376`, `gmail`, `google_drive_mcp`.
+- **Tests** : `uv run python test_agent.py` → `ALL LOCAL CHECKS PASSED` (règles métier,
+  outils v9 mockés : dry-run sans POST, POST avec bon `email_template_id`, anti-doublon,
+  palier, solde/paiement partiel, scope, 409, plafond, PDF trop gros ; garde-fou v2 allow/deny ;
+  run scripté). `uv run agents info` → 9 outils `client.*`, 3 connecteurs, `RelanceGuardrail`.
+
+**Reste avant le premier envoi réel** (inchangé, section 3) : scope `customer_invoices:all`
++ MAJ secret `cle_api_pennylane`, modèles j+30/j+45 dans l'UI Pennylane, puis déploiement
+progressif selon la section 6 (étape 0 en dry-run 1 semaine → paliers un par un).

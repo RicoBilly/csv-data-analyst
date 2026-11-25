@@ -1,9 +1,11 @@
 # relance-factures-poc
 
-POC **lecture seule** de l'agent « Relance de facture » : un agent Mistral (Agents SDK) qui
-lit les factures clients impayées dans **Pennylane** via le connecteur `pennylane_e376`
-(connexion de l'utilisateur, on-behalf-of) et produit un **rapport à blanc** du plan de
-relance — aucun envoi, aucune écriture (garde-fou `ReadOnlyPennylaneGuardrail`).
+Agent **« Relance de facture »** (Mistral Agents SDK) : il lit les factures clients impayées
+dans **Pennylane** (API Company v2 via outils serveur `client.*`, token lu dans l'environnement
+du worker depuis le secret workspace ; connecteur MCP `pennylane_e376` en secours) et produit
+le plan de relance. La phase 2 (v9) ajoute les actions réelles **en dry-run par défaut**
+(`RELANCE_DRY_RUN=true`) : envois e-mail Pennylane J+15/30/45, brouillon Gmail avec PDF pour
+J+60, lettre de mise en demeure stockée dans Drive pour J+90, journal Drive anti-doublon.
 
 ## Règles métier appliquées (outil déterministe `compute_relance_report`)
 
@@ -37,5 +39,37 @@ session with `execute_workflow` (input = session start message), and later attac
 schedule with `create_workflow_schedule` (phase 2, nécessite des credentials workspace sur
 les connecteurs car les schedules n'ont pas d'utilisateur).
 
-Phase 2 (envois réels, brouillons Gmail J+60, mise en demeure Drive J+90, schedule
-quotidien, stats) : voir la revue de faisabilité [PHASE2-FAISABILITE.md](PHASE2-FAISABILITE.md).
+## Phase 2 (v9) — implémentée, dry-run par défaut
+
+Nouveaux outils serveur (`client.*`, le token et les gros payloads ne transitent jamais par
+le contexte de l'agent) :
+
+- `fetch_relance_plan(company_id, today, journal_json)` : plan du jour calculé côté serveur
+  (GET `/me`, `/customers`, `/customer_invoices`), filtré par le journal Drive
+  (`journal-relances.json`), chaque facture annotée d'une action : `pennylane_email` (niveaux
+  1-3), `gmail_draft` (J+60), `drive_letter` (J+90).
+- `send_pennylane_invoice_email(company_id, invoice_id, stage, dry_run, journal_json)` :
+  validations serveur (facture non soldée, pas de paiement partiel, palier recalculé == demandé,
+  anti-doublon journal, scope `customer_invoices:all` via `GET /me`, plafond quotidien
+  `RELANCE_DAILY_SEND_CAP` = 20, modèle d'email résolu par nom dans `/billing_email_templates`),
+  puis `POST /customer_invoices/{id}/send_by_email` (204 = en file d'envoi, 409 = PDF pas encore
+  généré → retry). Retourne l'entrée de journal + le journal mis à jour à réécrire dans Drive.
+- `fetch_invoice_pdf_base64(company_id, invoice_id)` : PDF via `public_file_url`, base64 si
+  ≤ 3 Mo (limite PJ brouillon Gmail), sinon `drive_link_hint`.
+
+Garde-fou v2 `RelanceGuardrail` : autorise `client.*`, les lectures Pennylane
+(`list_*`/`get_*`/`query_*` + curatés + `search_operations`), `gmail_create_draft` (+ lectures
+Gmail), les lectures/créations/mises à jour Drive ; **bloque** `run_operations`, tout envoi
+Gmail (`gmail_send_email`, `gmail_send_draft`), les suppressions/labels Gmail, les suppressions
+et permissions Drive, `run_typescript` et tout autre connecteur.
+
+Sécurités par défaut : `RELANCE_DRY_RUN=true` (aucun POST tant que non désactivé explicitement),
+plafond `RELANCE_DAILY_SEND_CAP=20` envois/jour. Le journal Drive (`journal-relances.json` dans
+le dossier `Relance-factures`) est la source de vérité anti-doublon — clé `(invoice_id, stage)`
+(les entrées `dry_run: true` ne bloquent pas un envoi réel ultérieur).
+
+Prérequis avant tout envoi réel (voir [PHASE2-FAISABILITE.md](PHASE2-FAISABILITE.md) §3) :
+scope `customer_invoices:all` sur la clé API + mise à jour du secret `cle_api_pennylane`,
+création des modèles « Relance impayée j+30 » / « j+45 » dans l'UI Pennylane (seul j+15 existe,
+id `153549164544`), et éventuellement des credentials workspace sur `gmail`/`google_drive_mcp`
+pour un schedule sans utilisateur.

@@ -1,7 +1,7 @@
 [project]
 name = "relance-factures-poc"
 version = "0.1.0"
-description = "POC lecture seule : rapport a blanc du plan de relance des factures clients Pennylane (J+15/30/45/60/90), aucun envoi"
+description = "Agent de relance des factures clients Pennylane (plan J+15/30/45/60/90 deterministe ; phase 2 v9 en dry-run par defaut : envois Pennylane, brouillon Gmail J+60, lettre Drive J+90)"
 requires-python = ">=3.12"
 dependencies = [
     "mistralai-agents>=1.1.2,<1.2",
