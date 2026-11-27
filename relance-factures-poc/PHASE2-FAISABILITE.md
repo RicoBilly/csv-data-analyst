@@ -221,3 +221,30 @@ dry-run 1 semaine → paliers un par un).
   rapport `rapport-2026-11-27.md` (id `1pjSwb1GI4ul6FqBsaXfZO5mxxAi-wNs0`).
 - **Reste** : item 2 (modèles j+30/j+45 dans l'UI Pennylane) ; puis étape 0 du plan §6
   (dry-run 1 semaine) avant tout envoi réel.
+
+## 11. Addendum 2026-11-27 — Changement API Pennylane (oct. 2026) : les modèles de RELANCE ne sont plus listés par `GET /billing_email_templates`
+
+Vérification live le 2026-11-27 (exécution `aed1ca07…d68`, company_id 21994007, nouvelle clé
+`relance-factures-poc`) : `GET /api/external/v2/billing_email_templates` ne retourne plus que
+4 modèles (3045580 « new invoice », 3045576 « Envoi facture ID Interactive », 3045581
+« new quote », 3045577 « Envoi devis ID Interactive »). **Aucun** des noms
+« Relance impayée j+15 / j+30 / j+45 » n'y figure, et l'ancien modèle j+15 (id `153549164544`,
+présent le 2026-11-23) en a disparu. Les 3 dry-runs ciblés (paliers 1/2/3) retournent
+`template_id=null` + warning « absent de GET /billing_email_templates ».
+
+**Cause (doc officielle `getBillingEmailTemplates`, mise à jour 2026-10-21)** : « Payment
+reminders, GoCardless subscription emails, and PDF footer templates are **not included** »
+dans `/billing_email_templates`. Depuis cette évolution, les modèles d'e-mails de relance
+(paiement) sont exclus de la liste, même s'ils restent utilisables.
+
+**Conséquence pour v9** : la résolution par nom via la liste ne fonctionne plus pour les
+modèles de relance. `POST /customer_invoices/{id}/send_by_email` accepte toujours
+`email_template_id` (kind `billing_email_invoice`, dont font partie les modèles de relance
+créés dans l'UI), donc les envois restent possibles avec les bons IDs.
+
+**Correctif prévu (v10)** : résolution des template_id par **configuration explicite**
+(ex. env `RELANCE_TEMPLATE_IDS="1:<id j+15>,2:<id j+30>,3:<id j+45>"` ou mapping dans
+`PHASE2_CONFIG`), la résolution par nom via la liste restant un fallback ; à défaut, omettre
+`email_template_id` (Pennylane utilise alors le modèle d'envoi par défaut selon la langue du
+client) avec warning. Les IDs numériques se lisent dans l'URL d'édition du modèle dans l'UI
+Pennylane (Paramètres entreprise › Facturation clients › Emails).
