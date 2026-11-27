@@ -73,11 +73,14 @@ Valeurs concrètes **fournies et vérifiées le 2026-11-23** (constantes `PHASE2
 
 Checklist restante :
 
-1. **Scope `customer_invoices:all`** sur la clé API Pennylane (à côté de `customers:readonly`
-   et `ledger_accounts:readonly` ; le listing des modèles d'e-mail fonctionne déjà avec le
-   token actuel via `/billing_email_templates`), puis mise à jour du secret workspace
-   `cle_api_pennylane` (la valeur change → re-lier le secret au déploiement, comme déjà
-   fait en console).
+1. ✅ **FAIT le 2026-11-27** — Nouvelle clé API Pennylane `relance-factures-poc` créée dans
+   l'UI (Paramètres entreprise › Connectivité › Développeurs) avec le scope
+   `customer_invoices:all` (+ `customers:readonly`, `ledger_accounts:readonly`) ; valeur
+   enregistrée comme nouvelle version du secret workspace `cle_api_pennylane` dans
+   Studio › Secrets Manager (binding du déploiement `relance-factures-poc` inchangé :
+   `secret_name=cle_api_pennylane` → env `cle_api_pennylane`). Déploiement redéployé sur
+   `5fe33a9` (v9) et **vérifié en live par le run dry-run du 2026-11-27** : `GET /me` vu
+   par le worker retourne `customer_invoices:all` → `scopes_ok=true` dans `fetch_relance_plan`.
 2. **Créer `Relance impayée j+30` et `Relance impayée j+45` dans l'UI Pennylane** — seul
    `Relance impayée j+15` existe (id `153549164544`, confirmé par la sonde en live le
    2026-11-23). La sonde les retrouvera automatiquement par leur nom
@@ -190,6 +193,31 @@ L'architecture de la section 4 est codée dans `main.py` (l'agent garde le nom/d
   palier, solde/paiement partiel, scope, 409, plafond, PDF trop gros ; garde-fou v2 allow/deny ;
   run scripté). `uv run agents info` → 9 outils `client.*`, 3 connecteurs, `RelanceGuardrail`.
 
-**Reste avant le premier envoi réel** (inchangé, section 3) : scope `customer_invoices:all`
-+ MAJ secret `cle_api_pennylane`, modèles j+30/j+45 dans l'UI Pennylane, puis déploiement
-progressif selon la section 6 (étape 0 en dry-run 1 semaine → paliers un par un).
+**Reste avant le premier envoi réel** (section 3) : ✅ scope `customer_invoices:all` +
+secret `cle_api_pennylane` faits et vérifiés en live (addendum 10) ; il reste les modèles
+j+30/j+45 dans l'UI Pennylane, puis déploiement progressif selon la section 6 (étape 0 en
+dry-run 1 semaine → paliers un par un).
+
+## 10. Addendum 2026-11-27 — clé API `relance-factures-poc` (scope `customer_invoices:all`) en place, v9 redéployée et vérifiée en dry-run
+
+- **Clé API** : nouveau token Pennylane `relance-factures-poc` (Paramètres entreprise ›
+  Connectivité › Développeurs) avec `customer_invoices:all` + `customers:readonly` +
+  `ledger_accounts:readonly` ; valeur stockée comme nouvelle version du secret workspace
+  `cle_api_pennylane` (Studio › Secrets Manager). La valeur n'a jamais transité par le chat
+  ni le repo.
+- **Déploiement** : `relance-factures-poc` redéployé sur `5fe33a92183038474ebb7c8be05dc38856633483`
+  (branche `vibe/relance-factures-poc-226b64`) ; binding secret conservé
+  (`cle_api_pennylane` → env `cle_api_pennylane`, lu au boot du worker). Rollout `succeeded`,
+  `deployed_revision = 5fe33a9…`, workers actifs.
+- **Vérification live (dry-run, aucun envoi)** : exécution `aed1ca07…61c` du 2026-11-27,
+  `company_id=21994007`. `fetch_relance_plan` → `scopes_ok=true` (`customer_invoices:all`
+  présent dans `GET /me`), 3 161 factures lues (32 pages, GET uniquement), 62 factures en
+  retard avec action prévue (reste dû 71 648,52 EUR) : J+15 = 5, J+30 = 11, J+45 = 4,
+  J+60 = 12, J+90 = 30. 20 simulations `send_pennylane_invoice_email(dry_run=true)` :
+  5 OK au palier 1 (modèle j+15 id `153549164544`), 15 bloquées côté modèle (j+30/j+45
+  absents — item 2 de la checklist), **0 envoi réel**, 0 brouillon Gmail, 0 lettre.
+- **Persistance Drive** : `journal-relances.json` créé (id `1yg8KewMYWBbLQnmnABvHkSTlZ-a5z2nV`,
+  5 entrées `dry_run: true`), sous-dossier `rapports` créé (id `1FzlXMioz8qygCzCF1PgcM8TlHDl0ESgB`),
+  rapport `rapport-2026-11-27.md` (id `1pjSwb1GI4ul6FqBsaXfZO5mxxAi-wNs0`).
+- **Reste** : item 2 (modèles j+30/j+45 dans l'UI Pennylane) ; puis étape 0 du plan §6
+  (dry-run 1 semaine) avant tout envoi réel.

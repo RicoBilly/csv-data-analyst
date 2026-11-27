@@ -69,7 +69,8 @@ le dossier `Relance-factures`) est la source de vérité anti-doublon — clé `
 (les entrées `dry_run: true` ne bloquent pas un envoi réel ultérieur).
 
 Prérequis avant tout envoi réel (voir [PHASE2-FAISABILITE.md](PHASE2-FAISABILITE.md) §3) :
-scope `customer_invoices:all` sur la clé API + mise à jour du secret `cle_api_pennylane`,
-création des modèles « Relance impayée j+30 » / « j+45 » dans l'UI Pennylane (seul j+15 existe,
-id `153549164544`), et éventuellement des credentials workspace sur `gmail`/`google_drive_mcp`
-pour un schedule sans utilisateur.
+✅ scope `customer_invoices:all` sur la clé API `relance-factures-poc` + secret
+`cle_api_pennylane` à jour, vérifié en live le 2026-11-27 (`scopes_ok=true` via `GET /me`,
+voir addendum 10) ; il reste la création des modèles « Relance impayée j+30 » / « j+45 »
+dans l'UI Pennylane (seul j+15 existe, id `153549164544`), et éventuellement des credentials
+workspace sur `gmail`/`google_drive_mcp` pour un schedule sans utilisateur.
