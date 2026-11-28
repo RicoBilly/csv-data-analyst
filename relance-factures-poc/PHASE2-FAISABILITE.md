@@ -200,8 +200,9 @@ L'architecture de la section 4 est codée dans `main.py` (l'agent garde le nom/d
   run scripté). `uv run agents info` → 9 outils `client.*`, 3 connecteurs, `RelanceGuardrail`.
 
 **Reste avant le premier envoi réel** (section 3) : ✅ scope `customer_invoices:all` +
-secret `cle_api_pennylane` faits et vérifiés en live (addendum 10) ; il reste les modèles
-j+30/j+45 dans l'UI Pennylane, puis déploiement progressif selon la section 6 (étape 0 en
+secret `cle_api_pennylane` faits et vérifiés en live (addendum 10) ; ✅ les 3 modèles de
+relance j+15/j+30/j+45 créés dans l'UI et **vérifiés en live** (ids résolus via la config,
+addendum 13) ; il reste le déploiement progressif selon la section 6 (étape 0 en
 dry-run 1 semaine → paliers un par un).
 
 ## 10. Addendum 2026-11-27 — clé API `relance-factures-poc` (scope `customer_invoices:all`) en place, v9 redéployée et vérifiée en dry-run
@@ -271,3 +272,31 @@ modèles de relance. Correctif codé dans `main.py` (branche `vibe/relance-factu
 - `fetch_pennylane_email_templates` rapporte aussi `configured_template_ids` et la note oct. 2026 ;
 - tests : env prioritaire (sans appel liste), fallback par nom, absent (warning/ToolError),
   allow-default (POST sans template) → `ALL LOCAL CHECKS PASSED`.
+
+## 13. Addendum 2026-11-28 — correctif v10 déployé et vérifié en live : les 3 modèles de relance sont résolus par leurs id explicites
+
+- **Déploiement** : `relance-factures-poc` redéployé sur `81f48ff2f9889ea6fb16402fa0e7dcc5183506b4`
+  (v13 = correctif v10), sans passer `secrets` (HTTP 403 sinon) → binding `cle_api_pennylane`
+  → env `cle_api_pennylane` conservé ; rollout `succeeded`, `deployed_revision = 81f48ff…`.
+- **Vérification live (lecture seule, aucun envoi, aucune écriture)** : exécution
+  `aed1ca0767795416b456a3309fc06073b230c2d4ec775eafa0267c8c233c48f5` du 2026-11-28T10:14Z,
+  `company_id=21994007`, sonde `fetch_pennylane_email_templates` + lecture journal Drive +
+  `fetch_relance_plan` + 3 dry-runs ciblés (premier item de chaque palier 1/2/3).
+- **Plan** : `scopes_ok=true`, 3 161 factures lues (32 pages), **60 actions prévues,
+  69 879,72 EUR**, `by_stage {1: 4, 2: 11, 3: 3, 4: 13, 5: 29}`, `excluded_by_journal: 0`.
+- **3 dry-runs `send_pennylane_invoice_email(dry_run=true)`** — tous `sent=false`,
+  `dry_run=true`, `status_http=null`, `warning=null`, `template_source="config"` :
+  - palier 1 (J+15) facture `32970332618752` (FC-2026-10-1428, FRAVALO IMMOBILIER) →
+    `template_id=153549164544` ✅
+  - palier 2 (J+30) facture `32177488961536` (FC-2026-10-1384, Sté des Périodiques de l'Ouest) →
+    `template_id=161268740096` ✅
+  - palier 3 (J+45) facture `28451704139776` (FC-2026-08-1232, SOC RELINCO) →
+    `template_id=161268875264` ✅
+- **Conclusion** : item 2 de la checklist §3 ✅ — les 3 modèles de relance créés dans l'UI
+  Pennylane sont bien résolus par l'agent via leurs **id explicites en config** (aucun appel
+  à la liste, aucun fallback, aucun modèle par défaut) ; **0 envoi réel** (POC lecture seule).
+- **Reste avant le premier envoi réel** : étape 0 du plan §6 (dry-run 1 semaine) → activation
+  des paliers un par un (J+15 → J+30 → J+45 → brouillons J+60 → lettres J+90) ; credentials
+  workspace `gmail`/`google_drive_mcp` pour un schedule sans utilisateur ; décision politique
+  e-invoicing (risque R2 : envoyer la facture par e-mail peut empêcher la transmission PA
+  ultérieure).
