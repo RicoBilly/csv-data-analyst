@@ -72,5 +72,5 @@ Prérequis avant tout envoi réel (voir [PHASE2-FAISABILITE.md](PHASE2-FAISABILI
 ✅ scope `customer_invoices:all` sur la clé API `relance-factures-poc` + secret
 `cle_api_pennylane` à jour, vérifié en live le 2026-11-27 (`scopes_ok=true` via `GET /me`,
 voir addendum 10) ; il reste la création des modèles « Relance impayée j+30 » / « j+45 »
-dans l'UI Pennylane (seul j+15 existe, id `153549164544`), et éventuellement des credentials
+dans l'UI Pennylane (seul j+15 existe, id `153549164544`), ✅ modèles j+30/j+45 créés (ids `161268740096` / `161268875264`) et passés en id explicites v10 (`RELANCE_TEMPLATE_IDS` / `PHASE2_CONFIG.relance_email_template_ids`, car la liste API exclut les relances depuis oct. 2026 — voir addendum 11), et éventuellement des credentials
 workspace sur `gmail`/`google_drive_mcp` pour un schedule sans utilisateur.

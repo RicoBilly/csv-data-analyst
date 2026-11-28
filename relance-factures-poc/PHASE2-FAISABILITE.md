@@ -85,6 +85,12 @@ Checklist restante :
    `Relance impayée j+15` existe (id `153549164544`, confirmé par la sonde en live le
    2026-11-23). La sonde les retrouvera automatiquement par leur nom
    (`PHASE2_CONFIG.relance_email_templates` dans `main.py`).
+   ✅ **FAIT le 2026-11-28** : les 3 modèles existent dans l'UI (société 21994007, sous-onglet
+   emails_and_annexes) avec les id `153549164544` (j+15, par défaut), `161268740096` (j+30),
+   `161268875264` (j+45). Comme la liste API les exclut depuis oct. 2026 (voir addendum 11),
+   le correctif **v10** les passe en **id explicites** (`PHASE2_CONFIG.relance_email_template_ids`,
+   surchargeables par l'env `RELANCE_TEMPLATE_IDS="1:<id>,2:<id>,3:<id>"`) ; fallback par nom via
+   la liste ; envoi réel refusé sans modèle résolu sauf `RELANCE_ALLOW_DEFAULT_TEMPLATE=true`.
 3. **Connecteurs `gmail` et `google_drive_mcp`** déjà actifs et authentifiés sur le compte
    `eric.doyen@id-interactive.fr` ✅ ; pour les schedules (sans utilisateur), des
    **credentials workspace** seront peut-être nécessaires sur ces connecteurs.
@@ -248,3 +254,20 @@ créés dans l'UI), donc les envois restent possibles avec les bons IDs.
 `email_template_id` (Pennylane utilise alors le modèle d'envoi par défaut selon la langue du
 client) avec warning. Les IDs numériques se lisent dans l'URL d'édition du modèle dans l'UI
 Pennylane (Paramètres entreprise › Facturation clients › Emails).
+
+## 12. Addendum 2026-11-28 — correctif v10 implémenté : template_id explicites pour les relances
+
+Le changement API d'oct. 2026 (addendum 11) rendait la résolution par nom inopérante pour les
+modèles de relance. Correctif codé dans `main.py` (branche `vibe/relance-factures-poc-226b64`) :
+
+- `PHASE2_CONFIG["relance_email_template_ids"]` = `{1: 153549164544, 2: 161268740096, 3: 161268875264}`
+  (ids lus dans l'UI Pennylane, société 21994007), surchargeable par l'env
+  `RELANCE_TEMPLATE_IDS` au format `"1:<id>,2:<id>,3:<id>"` ;
+- `_resolve_template()` : id explicite d'abord (source `config`, aucun appel à la liste), sinon
+  matching du nom dans `GET /billing_email_templates` (source `list`) ;
+- `send_pennylane_invoice_email` : si aucun modèle résolu → dry-run = warning, envoi réel =
+  ToolError (refus), sauf si `RELANCE_ALLOW_DEFAULT_TEMPLATE=true` (POST sans `email_template_id`
+  = modèle par défaut Pennylane, avec warning) ;
+- `fetch_pennylane_email_templates` rapporte aussi `configured_template_ids` et la note oct. 2026 ;
+- tests : env prioritaire (sans appel liste), fallback par nom, absent (warning/ToolError),
+  allow-default (POST sans template) → `ALL LOCAL CHECKS PASSED`.

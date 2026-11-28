@@ -667,7 +667,26 @@ def test_send_pennylane_invoice_email() -> None:
             assert "Plafond" in str(e)
         assert not posts
 
-        # modele du palier absent : dry-run -> warning (pas d'exception), envoi reel -> ToolError
+        # --- v10 : resolution des modeles par id explicite (env RELANCE_TEMPLATE_IDS / config) ---
+        # 1) env prioritaire : stage 1 -> id 999, SANS appeler la liste (exclut les relances depuis oct. 2026)
+        os.environ[main.RELANCE_TEMPLATE_IDS_ENV] = "1:999,2:888,3:777"
+        def fake_get_nolist(path, params, company_id):
+            if path == "/billing_email_templates":
+                raise AssertionError("la liste ne doit pas etre appelee quand un id est configure")
+            return fake_get(path, params, company_id)
+        main._api_v2_get = fake_get_nolist
+        out_env = send_pennylane_invoice_email(21994007, 5, 1, dry_run=True, journal_json="[]")
+        assert out_env["template_id"] == 999 and out_env["template_source"] == "config"
+        main._api_v2_get = fake_get
+
+        # 2) fallback par nom via la liste quand aucun id explicite (config vide, pas d'env)
+        saved_ids = main.PHASE2_CONFIG.get("relance_email_template_ids")
+        main.PHASE2_CONFIG["relance_email_template_ids"] = {}
+        os.environ.pop(main.RELANCE_TEMPLATE_IDS_ENV, None)
+        out_list = send_pennylane_invoice_email(21994007, 5, 1, dry_run=True, journal_json="[]")
+        assert out_list["template_id"] == 153549164544 and out_list["template_source"] == "list"
+
+        # 3) aucun modele resolu : dry-run -> warning (pas d'exception), envoi reel -> ToolError (refus par defaut)
         def fake_get_no_tpl(path, params, company_id):
             if path == "/billing_email_templates":
                 return {"items": [], "has_more": False}
@@ -680,9 +699,18 @@ def test_send_pennylane_invoice_email() -> None:
             raise AssertionError("should have raised")
         except agents.ToolError as e:
             assert "Modele d'email" in str(e)
+        # 4) RELANCE_ALLOW_DEFAULT_TEMPLATE=true : envoi reel sans email_template_id + warning
+        os.environ[main.RELANCE_ALLOW_DEFAULT_TEMPLATE_ENV] = "true"
+        posts.clear()
+        outd = send_pennylane_invoice_email(21994007, 5, 1, dry_run=False, journal_json="[]")
+        assert outd["sent"] is True and posts == [("/customer_invoices/5/send_by_email", 21994007, {})]
+        assert outd["template_id"] is None and outd["warning"]
+        os.environ.pop(main.RELANCE_ALLOW_DEFAULT_TEMPLATE_ENV, None)
         main._api_v2_get = fake_get
+        main.PHASE2_CONFIG["relance_email_template_ids"] = saved_ids
     finally:
         main._api_v2_get, main._api_v2_post = orig_get, orig_post
+        os.environ.pop(main.RELANCE_TEMPLATE_IDS_ENV, None)
         del os.environ[main.API_TOKEN_ENV]
     print("send_pennylane_invoice_email tests: OK")
 

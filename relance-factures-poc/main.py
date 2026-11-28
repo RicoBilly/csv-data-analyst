@@ -44,8 +44,12 @@ API_TOKEN_ENV_FALLBACK = "cle_api_pennylane"
 # - compte Gmail du connecteur gmail : eric.doyen@id-interactive.fr (verifie via from:me)
 # - dossier Drive "Relance-factures" : id 1D3gWJnITWIpHHUKo13jgBClAmzWInDqP, owner
 #   eric.doyen@id-interactive.fr, can_add_children=true, vide a la creation
-# - modeles d'email Pennylane de relance impayee (kind billing_email_invoice), a
-#   resoudre en id via fetch_pennylane_email_templates avant tout send_by_email
+# - modeles d'email Pennylane de relance impayee (kind billing_email_invoice). Depuis le
+#   changement API d'oct. 2026, GET /billing_email_templates EXCLUT les modeles de relance
+#   ("Payment reminders ... are not included", doc getBillingEmailTemplates maj 2026-10-21) :
+#   leurs id ne sont plus decouvrables par nom via la liste -> id explicites ci-dessous
+#   (societe 21994007, lus 2026-11-27), surchargeables par l'env RELANCE_TEMPLATE_IDS
+#   au format "1:<id>,2:<id>,3:<id>"
 PHASE2_CONFIG = {
     "gmail_account": "eric.doyen@id-interactive.fr",
     "drive_folder_title": "Relance-factures",
@@ -55,12 +59,26 @@ PHASE2_CONFIG = {
         2: "Relance impayée j+30",
         3: "Relance impayée j+45",
     },
+    # id explicites des modeles de relance (company 21994007) - la liste API ne les retourne plus depuis oct. 2026
+    "relance_email_template_ids": {
+        1: 153549164544,
+        2: 161268740096,
+        3: 161268875264,
+    },
 }
 
 # Phase 2 (v9) : securites par defaut
 RELANCE_DRY_RUN_ENV = "RELANCE_DRY_RUN"          # "true" par defaut : aucun envoi reel tant que non desactive explicitement
 RELANCE_DAILY_CAP_ENV = "RELANCE_DAILY_SEND_CAP"  # plafond d'envois e-mail Pennylane reels par jour
 DEFAULT_DAILY_SEND_CAP = 20
+# v10 : id explicites des modeles de relance (la liste API exclut les "payment reminders" depuis
+# oct. 2026). Format "1:153549164544,2:161268740096,3:161268875264". Non defini = fallback sur
+# PHASE2_CONFIG["relance_email_template_ids"], puis sur la resolution par nom via la liste.
+RELANCE_TEMPLATE_IDS_ENV = "RELANCE_TEMPLATE_IDS"
+# si "true" et aucun modele resolu pour le palier : envoi reel autorise SANS email_template_id
+# (Pennylane utilise alors le modele d'envoi par defaut selon la langue du client) + warning.
+# Par defaut (absent) : envoi reel REFUSE sans modele resolu (jamais de mail hors sujet).
+RELANCE_ALLOW_DEFAULT_TEMPLATE_ENV = "RELANCE_ALLOW_DEFAULT_TEMPLATE"
 PDF_MAX_BYTES = 3_000_000                         # limite PJ brouillon Gmail (~3 Mo)
 JOURNAL_FILENAME = "journal-relances.json"
 REPORTS_FOLDER = "rapports"
@@ -615,14 +633,47 @@ def _stage_for(deadline: date | None, issue: date | None, run_date: date) -> tup
     return stage, days_late
 
 
-def _resolve_template_id(company_id: int, stage: int) -> dict[str, Any] | None:
-    """Resout le modele d'email Pennylane du palier (nom depuis PHASE2_CONFIG) via GET /billing_email_templates."""
+def _configured_template_ids() -> dict[int, int]:
+    """Id explicites des modeles de relance : env RELANCE_TEMPLATE_IDS ("1:<id>,2:<id>,3:<id>") prioritaire, sinon PHASE2_CONFIG."""
+    raw = os.environ.get(RELANCE_TEMPLATE_IDS_ENV, "").strip()
+    if raw:
+        out: dict[int, int] = {}
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            stage_s, _, id_s = part.partition(":")
+            try:
+                stage_i, tid = int(stage_s.strip()), int(id_s.strip())
+            except ValueError:
+                continue
+            if stage_i in (1, 2, 3) and tid > 0:
+                out[stage_i] = tid
+        if out:
+            return out
+    return {int(k): int(v) for k, v in PHASE2_CONFIG.get("relance_email_template_ids", {}).items()}
+
+
+def _resolve_template(company_id: int, stage: int) -> dict[str, Any] | None:
+    """Resout le modele d'email Pennylane du palier.
+
+    Ordre de resolution (v10) :
+    1. id explicite : env RELANCE_TEMPLATE_IDS puis PHASE2_CONFIG["relance_email_template_ids"]
+       (necessaire depuis oct. 2026 : GET /billing_email_templates exclut les modeles de
+       relance "payment reminders") ;
+    2. fallback : matching du nom (PHASE2_CONFIG["relance_email_templates"]) dans
+       GET /billing_email_templates (ne marche plus que pour les modeles non-relance).
+    Retourne {"id": ..., "source": "config"|"list", "name": ...} ou None.
+    """
+    ids = _configured_template_ids()
+    if stage in ids:
+        return {"id": ids[stage], "source": "config", "name": PHASE2_CONFIG["relance_email_templates"].get(stage)}
     wanted = _norm_key(PHASE2_CONFIG["relance_email_templates"][stage])
     data = _api_v2_get("/billing_email_templates", {"limit": 100}, company_id)
     for it in data.get("items", []):
         blob = _norm_key(" ".join(str(v) for v in it.values() if isinstance(v, str)))
         if wanted in blob:
-            return it
+            return {"id": it.get("id"), "source": "list", "name": it.get("name") or it.get("label")}
     return None
 
 
@@ -1058,10 +1109,15 @@ def fetch_pennylane_email_templates(company_id: int, max_pages: int = 10) -> dic
     lines.append(f"Modeles de relance impayee trouves (j+15 / j+30 / j+45) : {len(found)}")
     for f in found:
         lines.append(f"- `{f['path']}` id={f['id']} name=\"{f['name']}\" kind={f.get('kind')}")
+    cfg_ids = _configured_template_ids()
+    lines.append("")
+    lines.append("Note (changement API oct. 2026) : GET /billing_email_templates exclut les modeles de relance (payment reminders).")
+    lines.append(f"Id explicites utilises par send_by_email (env {RELANCE_TEMPLATE_IDS_ENV} ou PHASE2_CONFIG) : {json.dumps(cfg_ids)}")
     return {
         "source": "pennylane_api_v2",
         "results": results,
         "relance_templates_found": found,
+        "configured_template_ids": cfg_ids,
         "report_markdown": "\n".join(lines),
     }
 
@@ -1185,12 +1241,15 @@ def send_pennylane_invoice_email(company_id: int, invoice_id: int, stage: int, d
     (prelevement automatique), echeance passee, palier recalcule == stage demande (J = echeance ; exclusion
     1re relance si emission = echeance), couple (invoice_id, stage) absent du journal, scope
     customer_invoices:all verifie via GET /me (envoi reel uniquement), plafond quotidien RELANCE_DAILY_SEND_CAP
-    (defaut 20, envoi reel uniquement), modele d'email du palier retrouve par son nom dans
-    GET /billing_email_templates. Envoi : POST /customer_invoices/{id}/send_by_email avec
-    {"email_template_id": id} (recipients laisse vide = e-mails du client dans Pennylane).
-    204 = e-mail en file d'envoi ; 409 = PDF pas encore genere (reessayer dans quelques minutes).
+    (defaut 20, envoi reel uniquement), modele d'email du palier resolu en id (v10 : d'abord via l'id explicite
+    env RELANCE_TEMPLATE_IDS / PHASE2_CONFIG relance_email_template_ids - necessaire car GET /billing_email_templates
+    exclut les modeles de relance depuis oct. 2026 -, sinon fallback par matching du nom dans la liste ; si aucun
+    modele n'est resolu, l'envoi reel est REFUSE sauf RELANCE_ALLOW_DEFAULT_TEMPLATE=true, auquel cas le POST est
+    fait sans email_template_id = modele par defaut Pennylane + warning). Envoi :
+    POST /customer_invoices/{id}/send_by_email avec {"email_template_id": id} (recipients laisse vide = e-mails
+    du client dans Pennylane). 204 = e-mail en file d'envoi ; 409 = PDF pas encore genere (reessayer dans quelques minutes).
 
-    Retourne : sent, dry_run, status_http, template_id, invoice_id, stage, customer_email, journal_entry
+    Retourne : sent, dry_run, status_http, template_id, template_source, invoice_id, stage, customer_email, warning, journal_entry
     (a ajouter au journal) et journal_json (journal mis a jour, pret a etre reecrit dans Drive).
     Le token n'est jamais un argument ni affiche.
     """
@@ -1244,23 +1303,35 @@ def send_pennylane_invoice_email(company_id: int, invoice_id: int, stage: int, d
     elif customer.get("email"):
         customer_email = customer["email"]
 
-    template = _resolve_template_id(company_id, stage)
+    template = _resolve_template(company_id, stage)
+    allow_default = os.environ.get(RELANCE_ALLOW_DEFAULT_TEMPLATE_ENV, "").strip().lower() == "true"
+    tpl_warning = None
     if template is None:
-        msg = (
-            f"Modele d'email du palier {stage} (\"{PHASE2_CONFIG['relance_email_templates'][stage]}\") absent de "
-            "GET /billing_email_templates : a creer dans l'UI Pennylane avant tout envoi reel."
+        tpl_warning = (
+            f"Modele d'email du palier {stage} (\"{PHASE2_CONFIG['relance_email_templates'][stage]}\") introuvable : "
+            "ni id explicite (env RELANCE_TEMPLATE_IDS / PHASE2_CONFIG relance_email_template_ids), ni matching par nom "
+            "dans GET /billing_email_templates (qui exclut les modeles de relance depuis oct. 2026). "
+            "Definir RELANCE_TEMPLATE_IDS=\"1:<id>,2:<id>,3:<id>\" avant tout envoi reel."
         )
         if dry:
             return {"sent": False, "dry_run": True, "invoice_id": invoice_id, "stage": stage, "template_id": None,
-                    "customer_email": customer_email, "warning": msg, "journal_entry": None, "journal_json": journal_json}
-        raise agents.ToolError(msg)
+                    "template_source": None, "customer_email": customer_email,
+                    "warning": tpl_warning + " Dry-run : aucun envoi effectue.",
+                    "journal_entry": None, "journal_json": journal_json}
+        if not allow_default:
+            raise agents.ToolError(tpl_warning)
+        tpl_warning += " Envoi reel avec le modele par defaut Pennylane (RELANCE_ALLOW_DEFAULT_TEMPLATE=true)."
 
     if dry:
-        entry = {"invoice_id": invoice_id, "stage": stage, "channel": "pennylane_email", "template_id": template.get("id"),
+        entry = {"invoice_id": invoice_id, "stage": stage, "channel": "pennylane_email",
+                 "template_id": template.get("id") if template else None,
                  "at": agents.now().isoformat(), "dry_run": True}
-        return {"sent": False, "dry_run": True, "status_http": None, "template_id": template.get("id"),
+        return {"sent": False, "dry_run": True, "status_http": None,
+                "template_id": template.get("id") if template else None,
+                "template_source": template.get("source") if template else None,
                 "invoice_id": invoice_id, "stage": stage, "customer_email": customer_email,
-                "journal_entry": entry, "journal_json": json.dumps(journal + [entry], ensure_ascii=False)}
+                "warning": tpl_warning, "journal_entry": entry,
+                "journal_json": json.dumps(journal + [entry], ensure_ascii=False)}
 
     me_blob = json.dumps(_api_v2_get("/me", {}, company_id), ensure_ascii=False)
     if "customer_invoices:all" not in me_blob:
@@ -1272,20 +1343,23 @@ def send_pennylane_invoice_email(company_id: int, invoice_id: int, stage: int, d
     if _journal_today_email_sends(journal, today.isoformat()) >= cap:
         raise agents.ToolError(f"Plafond quotidien atteint ({cap} envois/jour, env {RELANCE_DAILY_CAP_ENV}) : aucune relance supplementaire aujourd'hui.")
 
+    body: dict[str, Any] = {"email_template_id": template["id"]} if template else {}
     status_http, payload = _api_v2_post(
-        f"/customer_invoices/{invoice_id}/send_by_email", {}, company_id,
-        {"email_template_id": template.get("id")},
+        f"/customer_invoices/{invoice_id}/send_by_email", {}, company_id, body,
     )
     if status_http == 409:
         raise agents.ToolError(f"Facture {invoice_id} : HTTP 409, PDF pas encore genere cote Pennylane -> reessayer dans quelques minutes.")
     if status_http >= 400:
         body = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)[:300]
         raise agents.ToolError(f"send_by_email facture {invoice_id} -> HTTP {status_http}: {body}")
-    entry = {"invoice_id": invoice_id, "stage": stage, "channel": "pennylane_email", "template_id": template.get("id"),
+    entry = {"invoice_id": invoice_id, "stage": stage, "channel": "pennylane_email",
+             "template_id": template.get("id") if template else None,
              "at": agents.now().isoformat(), "dry_run": False}
     return {"sent": status_http in (200, 202, 204), "dry_run": False, "status_http": status_http,
-            "template_id": template.get("id"), "invoice_id": invoice_id, "stage": stage,
-            "customer_email": customer_email, "journal_entry": entry,
+            "template_id": template.get("id") if template else None,
+            "template_source": template.get("source") if template else None,
+            "invoice_id": invoice_id, "stage": stage,
+            "customer_email": customer_email, "warning": tpl_warning, "journal_entry": entry,
             "journal_json": json.dumps(journal + [entry], ensure_ascii=False)}
 
 
